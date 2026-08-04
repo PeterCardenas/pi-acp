@@ -102,7 +102,7 @@ test('PiAcpSession: emits agent_thought_chunk for thinking_delta', async () => {
   })
 })
 
-test('PiAcpSession: waits for read and bash arguments before rendering tool titles', async () => {
+test('PiAcpSession: waits for non-empty streamed arguments before rendering file and bash titles', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -115,6 +115,14 @@ test('PiAcpSession: waits for read and bash arguments before rendering tool titl
     fileCommands: []
   })
 
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'toolcall_start', toolCall: { id: 'read-1', name: 'read', arguments: {} } }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'toolcall_start', toolCall: { id: 'bash-1', name: 'bash', arguments: {} } }
+  })
   proc.emit({ type: 'tool_execution_start', toolCallId: 'read-1', toolName: 'read', args: { path: 'README.md' } })
   proc.emit({
     type: 'tool_execution_start',
@@ -195,6 +203,179 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
     terminal_exit: { terminal_id: 't1', exit_code: 0, signal: null }
   })
   assert.equal((conn.updates[2]!.update as any).rawOutput, undefined)
+})
+
+test('PiAcpSession: merges direct and partial streamed tool-call fields', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_start',
+      toolCall: { id: 'subagent-1' },
+      contentIndex: 0,
+      partial: { content: [{ id: 'subagent-1', name: 'subagent', arguments: { task: 'inspect' } }] }
+    }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(conn.updates.length, 1)
+  assert.equal((conn.updates[0]!.update as any).toolCallId, 'subagent-1')
+  assert.equal((conn.updates[0]!.update as any).title, 'subagent')
+})
+
+test('PiAcpSession: tracks subagent across cumulative partial snapshots despite bad direct names', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  for (const [name, partialArgs] of [
+    ['wrong', '{"task":"a"}'],
+    ['', '{"task":"a","x":1}'],
+    ['wrong', '{"task":"a","x":1,"y":2}']
+  ]) {
+    proc.emit({
+      type: 'message_update',
+      assistantMessageEvent: {
+        type: 'toolcall_delta',
+        toolCall: { id: 'subagent-1', name },
+        contentIndex: 0,
+        partial: { content: [{ id: 'subagent-1', name: 'subagent', partialArgs }] }
+      }
+    })
+  }
+  for (const text of ['one', 'one\ntwo', 'one\ntwo\nthree']) {
+    proc.emit({
+      type: 'tool_execution_update',
+      toolCallId: 'subagent-1',
+      partialResult: { content: [{ type: 'text', text }] }
+    })
+  }
+
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal((conn.updates[0]!.update as any).title, 'subagent')
+  assert.equal(conn.updates.filter(u => (u.update as any).rawOutput !== undefined).length, 0)
+})
+
+test('PiAcpSession: suppresses streamed subagent updates by tracked id', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_start',
+      toolCall: { id: 'subagent-1', name: 'subagent', arguments: {} }
+    }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_delta',
+      toolCall: { id: 'subagent-1', name: 'subagent', arguments: { task: 'inspect' } }
+    }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_end',
+      toolCall: { id: 'subagent-1', name: 'subagent', arguments: { task: 'inspect' } }
+    }
+  })
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'subagent-1',
+    toolName: 'subagent',
+    args: { task: 'inspect' }
+  })
+  for (const text of [
+    'child output 1',
+    'child output 1\\nchild output 2',
+    'child output 1\\nchild output 2\\nchild output 3'
+  ]) {
+    proc.emit({
+      type: 'tool_execution_update',
+      toolCallId: 'subagent-1',
+      toolName: 'bash',
+      partialResult: { content: [{ type: 'text', text }] }
+    })
+  }
+  const result = { content: [{ type: 'text', text: 'final result' }] }
+  proc.emit({ type: 'tool_execution_end', toolCallId: 'subagent-1', isError: false, result })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 5)
+  assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
+  assert.equal((conn.updates[0]!.update as any).status, 'pending')
+  for (const update of conn.updates.slice(1, 4)) {
+    assert.equal(update.update.sessionUpdate, 'tool_call_update')
+    assert.equal((update.update as any).content, undefined)
+    assert.equal((update.update as any).rawOutput, undefined)
+  }
+  assert.equal(conn.updates[4]!.update.sessionUpdate, 'tool_call_update')
+  assert.equal((conn.updates[4]!.update as any).status, 'completed')
+  assert.deepEqual((conn.updates[4]!.update as any).content, [
+    { type: 'content', content: { type: 'text', text: 'final result' } }
+  ])
+  assert.deepEqual((conn.updates[4]!.update as any).rawOutput, result)
+})
+
+test('PiAcpSession: renders a complete streamed bash title once', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'toolcall_start', toolCall: { id: 'bash-1', name: 'bash', arguments: {} } }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_end',
+      toolCall: { id: 'bash-1', name: 'bash', arguments: { command: 'printf hello' } }
+    }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const titles = conn.updates.map(entry => (entry.update as any).title).filter(Boolean)
+  assert.deepEqual(titles, ['printf hello'])
+  assert.equal((conn.updates[0]!.update as any).kind, 'execute')
 })
 
 test('PiAcpSession: waits for streamed edit arguments before rendering its title', async () => {

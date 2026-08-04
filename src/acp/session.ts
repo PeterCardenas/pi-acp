@@ -279,6 +279,7 @@ export class PiAcpSession {
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
   // and clients may hide progress if we ever downgrade back to `pending`.
   private currentToolCalls = new Map<string, 'pending' | 'in_progress'>()
+  private subagentToolCallIds = new Set<string>()
 
   // pi can emit multiple `turn_end` and `agent_end` events for a single user prompt
   // when retry, compaction, or queued continuations run. The session-level prompt
@@ -471,6 +472,7 @@ export class PiAcpSession {
     this.fileMutationToolCallIds.delete(toolCallId)
     this.bashToolCallIds.delete(toolCallId)
     this.bashOutputSnapshots.delete(toolCallId)
+    this.subagentToolCallIds.delete(toolCallId)
   }
 
   private async emitUsageUpdate(ev: PiRpcEvent): Promise<void> {
@@ -571,16 +573,20 @@ export class PiAcpSession {
         // Surface tool calls ASAP so clients (e.g. Zed) can show a tool-in-use/loading UI
         // while the model is still streaming tool call args.
         if (ame?.type === 'toolcall_start' || ame?.type === 'toolcall_delta' || ame?.type === 'toolcall_end') {
-          const toolCall =
-            // pi sometimes includes the tool call directly on the event
-            (ame as any)?.toolCall ??
-            // ...and always includes it in the partial assistant message at contentIndex
-            (ame as any)?.partial?.content?.[(ame as any)?.contentIndex ?? 0]
+          const directToolCall = (ame as any)?.toolCall
+          const partialToolCall = (ame as any)?.partial?.content?.[(ame as any)?.contentIndex ?? 0]
+          // Pi can expose a stale/incomplete direct call alongside the populated partial snapshot.
+          // Prefer populated partial fields while retaining direct fields as fallbacks.
+          const toolCall = {
+            ...(directToolCall ?? {}),
+            ...(partialToolCall ?? {})
+          }
 
-          const toolCallId = String((toolCall as any)?.id ?? '')
-          const toolName = String((toolCall as any)?.name ?? 'tool')
+          const toolCallId = String(toolCall.id ?? '')
+          const toolName = String(toolCall.name ?? 'tool')
 
           if (toolCallId) {
+            if (toolName === 'subagent') this.subagentToolCallIds.add(toolCallId)
             const rawInput =
               (toolCall as any)?.arguments && typeof (toolCall as any).arguments === 'object'
                 ? (toolCall as any).arguments
@@ -595,7 +601,11 @@ export class PiAcpSession {
                   })()
 
             // File and shell titles cannot be corrected after agentic.nvim renders them.
-            if ((isBashTool(toolName) || ['read', 'edit', 'write'].includes(toolName)) && rawInput === undefined) break
+            if (
+              (isBashTool(toolName) && bashCommand(rawInput) === undefined) ||
+              (['read', 'edit', 'write'].includes(toolName) && toolPath(rawInput) === undefined)
+            )
+              break
 
             const locations = toToolCallLocations(rawInput, this.cwd)
             const existingStatus = this.currentToolCalls.get(toolCallId)
@@ -648,6 +658,7 @@ export class PiAcpSession {
         const toolCallId = String((ev as any).toolCallId ?? crypto.randomUUID())
         const toolName = String((ev as any).toolName ?? 'tool')
         const args = (ev as any).args
+        if (toolName === 'subagent') this.subagentToolCallIds.add(toolCallId)
         let line: number | undefined
 
         if (
@@ -730,6 +741,7 @@ export class PiAcpSession {
         if (!toolCallId) break
 
         const partial = (ev as any).partialResult
+        if (this.subagentToolCallIds.has(toolCallId)) break
         if (this.bashToolCallIds.has(toolCallId)) {
           this.emitBashOutputUpdate({ toolCallId, status: 'in_progress', result: partial })
           break
