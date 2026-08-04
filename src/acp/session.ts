@@ -26,7 +26,7 @@ import {
   bashTerminalOutputMeta,
   isBashTool
 } from './translate/bash.js'
-import { toolResultToText } from './translate/pi-tools.js'
+import { toolCallTitle, toolPath, toolResultToText } from './translate/pi-tools.js'
 
 type SessionCreateParams = {
   cwd: string
@@ -266,6 +266,7 @@ export class PiAcpSession {
   readonly proc: PiRpcProcess
   private readonly conn: AgentSideConnection
   private readonly fileCommands: FileSlashCommand[]
+  private pendingUsageUpdates = new Set<Promise<void>>()
 
   // Used to map abort semantics to ACP stopReason.
   // Applies to the currently running turn.
@@ -454,6 +455,7 @@ export class PiAcpSession {
       sessionUpdate: 'tool_call_update',
       toolCallId: params.toolCallId,
       status: params.status,
+      content: text ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[]) : undefined,
       _meta: {
         ...(delta ? bashTerminalOutputMeta(params.toolCallId, delta) : {}),
         ...(params.status === 'completed' || params.status === 'failed'
@@ -469,6 +471,35 @@ export class PiAcpSession {
     this.fileMutationToolCallIds.delete(toolCallId)
     this.bashToolCallIds.delete(toolCallId)
     this.bashOutputSnapshots.delete(toolCallId)
+  }
+
+  private async emitUsageUpdate(ev: PiRpcEvent): Promise<void> {
+    const message = (ev as { message?: unknown }).message as
+      { usage?: { input?: unknown; cost?: { total?: unknown } }; contextWindow?: unknown } | undefined
+    const usage = message?.usage
+    if (typeof usage?.input !== 'number') return
+
+    let contextWindow: number | undefined =
+      typeof message?.contextWindow === 'number' ? message.contextWindow : undefined
+    if (contextWindow === undefined) {
+      try {
+        const state = (await this.proc.getState()) as { model?: { contextWindow?: unknown } }
+        if (typeof state.model?.contextWindow === 'number') contextWindow = state.model.contextWindow
+      } catch {
+        return
+      }
+    }
+    if (contextWindow === undefined || contextWindow <= 0) return
+
+    const inputTokens = usage.input
+    if (typeof inputTokens !== 'number') return
+    const totalCost = usage.cost?.total
+    this.emit({
+      sessionUpdate: 'usage_update',
+      used: inputTokens,
+      size: contextWindow,
+      ...(typeof totalCost === 'number' ? { cost: { amount: totalCost, currency: 'USD' } } : {})
+    })
   }
 
   private startTurn(t: QueuedTurn): void {
@@ -563,6 +594,9 @@ export class PiAcpSession {
                     }
                   })()
 
+            // File and shell titles cannot be corrected after agentic.nvim renders them.
+            if ((isBashTool(toolName) || ['read', 'edit', 'write'].includes(toolName)) && rawInput === undefined) break
+
             const locations = toToolCallLocations(rawInput, this.cwd)
             const existingStatus = this.currentToolCalls.get(toolCallId)
             // IMPORTANT: never downgrade status (e.g. if we already marked in_progress via tool_execution_start).
@@ -584,7 +618,7 @@ export class PiAcpSession {
               this.emit({
                 sessionUpdate: 'tool_call',
                 toolCallId,
-                title: toolName,
+                title: toolCallTitle(toolName, rawInput),
                 kind: toToolKind(toolName),
                 status,
                 locations,
@@ -615,6 +649,12 @@ export class PiAcpSession {
         const toolName = String((ev as any).toolName ?? 'tool')
         const args = (ev as any).args
         let line: number | undefined
+
+        if (
+          (isBashTool(toolName) && bashCommand(args) === undefined) ||
+          (['read', 'edit', 'write'].includes(toolName) && toolPath(args) === undefined)
+        )
+          break
 
         if (isBashTool(toolName)) {
           const locations = toToolCallLocations(args, this.cwd)
@@ -665,7 +705,7 @@ export class PiAcpSession {
           this.emit({
             sessionUpdate: 'tool_call',
             toolCallId,
-            title: toolName,
+            title: toolCallTitle(toolName, args),
             kind: toToolKind(toolName),
             status: 'in_progress',
             locations,
@@ -824,6 +864,9 @@ export class PiAcpSession {
       }
 
       case 'turn_end': {
+        const updatePromise = this.emitUsageUpdate(ev)
+        this.pendingUsageUpdates.add(updatePromise)
+        void updatePromise.finally(() => this.pendingUsageUpdates.delete(updatePromise))
         // pi uses `turn_end` for sub-steps (e.g. tool_use) and will often start another turn.
         // Do NOT resolve the ACP `session/prompt` here; wait for `agent_settled`.
         break
@@ -839,27 +882,29 @@ export class PiAcpSession {
       case 'agent_settled': {
         // Ensure all updates derived from pi events are delivered before we resolve
         // the ACP `session/prompt` request.
-        void this.flushEmits().finally(() => {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
-          this.pendingTurn?.resolve(reason)
-          this.pendingTurn = null
-          this.inAgentLoop = false
+        void Promise.all(this.pendingUsageUpdates)
+          .then(() => this.flushEmits())
+          .finally(() => {
+            const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
+            this.pendingTurn?.resolve(reason)
+            this.pendingTurn = null
+            this.inAgentLoop = false
 
-          // Start next queued prompt, if any.
-          const next = this.turnQueue.shift()
-          if (next) {
-            this.emit({
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
-            })
-            this.startTurn(next)
-          } else {
-            this.emit({
-              sessionUpdate: 'session_info_update',
-              _meta: { piAcp: { queueDepth: 0, running: false } }
-            })
-          }
-        })
+            // Start next queued prompt, if any.
+            const next = this.turnQueue.shift()
+            if (next) {
+              this.emit({
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
+              })
+              this.startTurn(next)
+            } else {
+              this.emit({
+                sessionUpdate: 'session_info_update',
+                _meta: { piAcp: { queueDepth: 0, running: false } }
+              })
+            }
+          })
         break
       }
 

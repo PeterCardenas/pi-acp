@@ -46,6 +46,7 @@ export function bashCommand(value: unknown): string | undefined {
 export function bashResultText(result: unknown): string {
   const record = result as BashResultRecord | null | undefined
   const content = record?.content
+  if (typeof content === 'string') return content
   if (Array.isArray(content)) {
     const texts = content
       .map(c => {
