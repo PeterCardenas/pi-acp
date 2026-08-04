@@ -9,6 +9,7 @@ export default defineConfig({
   clean: true,
   dts: false,
   splitting: false,
+  noExternal: ['@agentclientprotocol/sdk', 'zod'],
   minify: false,
   banner: {
     js: '#!/usr/bin/env node'
