@@ -34,6 +34,46 @@ test('PiAcpSession: emits agent_message_chunk for text_delta', async () => {
   })
 })
 
+test('PiAcpSession: translates turn_end usage into ACP usage_update', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.getState = async () => ({ model: { contextWindow: 8192 } })
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'turn_end',
+    message: {
+      usage: {
+        input: 1234,
+        output: 56,
+        totalTokens: 1290,
+        cost: { input: 0.01, output: 0.02, total: 0.03 }
+      },
+      contextWindow: 8192
+    }
+  })
+
+  proc.emit({
+    type: 'agent_settled'
+  })
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.deepEqual(conn.updates.find(update => update.update.sessionUpdate === 'usage_update')?.update, {
+    sessionUpdate: 'usage_update',
+    used: 1234,
+    size: 8192,
+    cost: { amount: 0.03, currency: 'USD' }
+  })
+})
+
 test('PiAcpSession: emits agent_thought_chunk for thinking_delta', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
@@ -60,6 +100,35 @@ test('PiAcpSession: emits agent_thought_chunk for thinking_delta', async () => {
     sessionUpdate: 'agent_thought_chunk',
     content: { type: 'text', text: 'thinking...' }
   })
+})
+
+test('PiAcpSession: waits for read and bash arguments before rendering tool titles', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 'read-1', toolName: 'read', args: { path: 'README.md' } })
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'bash-1',
+    toolName: 'bash',
+    args: { command: 'printf hello' }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.deepEqual(
+    conn.updates.map(entry => (entry.update as any).title),
+    ['read README.md', 'printf hello']
+  )
 })
 
 test('PiAcpSession: emits tool_call + tool_call_update + completes', async () => {
@@ -107,7 +176,9 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
   assert.equal(conn.updates[1]!.update.sessionUpdate, 'tool_call_update')
   assert.equal((conn.updates[1]!.update as any).toolCallId, 't1')
   assert.equal((conn.updates[1]!.update as any).status, 'in_progress')
-  assert.equal((conn.updates[1]!.update as any).content, undefined)
+  assert.deepEqual((conn.updates[1]!.update as any).content, [
+    { type: 'content', content: { type: 'text', text: 'running' } }
+  ])
   assert.deepEqual((conn.updates[1]!.update as any)._meta, {
     terminal_output: { terminal_id: 't1', data: 'running' }
   })
@@ -116,7 +187,9 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
   assert.equal(conn.updates[2]!.update.sessionUpdate, 'tool_call_update')
   assert.equal((conn.updates[2]!.update as any).toolCallId, 't1')
   assert.equal((conn.updates[2]!.update as any).status, 'completed')
-  assert.equal((conn.updates[2]!.update as any).content, undefined)
+  assert.deepEqual((conn.updates[2]!.update as any).content, [
+    { type: 'content', content: { type: 'text', text: 'done' } }
+  ])
   assert.deepEqual((conn.updates[2]!.update as any)._meta, {
     terminal_output: { terminal_id: 't1', data: 'done' },
     terminal_exit: { terminal_id: 't1', exit_code: 0, signal: null }
@@ -124,7 +197,7 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
   assert.equal((conn.updates[2]!.update as any).rawOutput, undefined)
 })
 
-test('PiAcpSession: emits tool locations from pi path args', async () => {
+test('PiAcpSession: waits for streamed edit arguments before rendering its title', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -137,13 +210,53 @@ test('PiAcpSession: emits tool locations from pi path args', async () => {
     fileCommands: []
   })
 
-  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'read', args: { path: 'src/acp/session.ts' } })
-
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'toolcall_start', toolCall: { id: 't1', name: 'edit' } }
+  })
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'edit', args: { path: 'src/index.ts' } })
   await new Promise(r => setTimeout(r, 0))
 
   assert.equal(conn.updates.length, 1)
-  assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
-  assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: `${process.cwd()}/src/acp/session.ts` }])
+  assert.equal((conn.updates[0]!.update as any).title, 'edit src/index.ts')
+})
+
+test('PiAcpSession: emits useful read tool title, location, and output', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const result = { content: [{ type: 'text', text: 'file contents' }] }
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'read', args: { path: 'src/acp/session.ts' } })
+  proc.emit({ type: 'tool_execution_end', toolCallId: 't1', toolName: 'read', result })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 2)
+  assert.deepEqual(conn.updates[0]!.update, {
+    sessionUpdate: 'tool_call',
+    toolCallId: 't1',
+    title: 'read src/acp/session.ts',
+    kind: 'read',
+    status: 'in_progress',
+    locations: [{ path: `${process.cwd()}/src/acp/session.ts` }],
+    rawInput: { path: 'src/acp/session.ts' }
+  })
+  assert.deepEqual(conn.updates[1]!.update, {
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 't1',
+    status: 'completed',
+    content: [{ type: 'content', content: { type: 'text', text: 'file contents' } }],
+    rawOutput: result
+  })
 })
 
 test('PiAcpSession: handles extension select via ACP permission request', async () => {
