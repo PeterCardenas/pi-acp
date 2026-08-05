@@ -266,8 +266,6 @@ export class PiAcpSession {
   readonly proc: PiRpcProcess
   private readonly conn: AgentSideConnection
   private readonly fileCommands: FileSlashCommand[]
-  private pendingUsageUpdates = new Set<Promise<void>>()
-
   // Used to map abort semantics to ACP stopReason.
   // Applies to the currently running turn.
   private cancelRequested = false
@@ -280,6 +278,12 @@ export class PiAcpSession {
   // and clients may hide progress if we ever downgrade back to `pending`.
   private currentToolCalls = new Map<string, 'pending' | 'in_progress'>()
   private subagentToolCallIds = new Set<string>()
+  private activeSubagentToolCalls = 0
+  // Streaming only describes arguments; active subagents begin at execution start.
+  private streamedSubagentToolCallIds = new Set<string>()
+  // Buffered usage from the most recent top-level `turn_end` for the current prompt.
+  // Only one `usage_update` is emitted per prompt, right before it settles.
+  private pendingUsageEvent: PiRpcEvent | null = null
 
   // pi can emit multiple `turn_end` and `agent_end` events for a single user prompt
   // when retry, compaction, or queued continuations run. The session-level prompt
@@ -377,6 +381,10 @@ export class PiAcpSession {
   async cancel(): Promise<void> {
     // Cancel current and clear any queued prompts.
     this.cancelRequested = true
+    // A subagent tool call may be left in flight with no `tool_execution_end` ever
+    // arriving once aborted; clear tracking now instead of relying on cleanup that
+    // may never run for it.
+    this.resetSubagentTracking()
 
     if (this.turnQueue.length) {
       const queued = this.turnQueue.splice(0, this.turnQueue.length)
@@ -472,7 +480,10 @@ export class PiAcpSession {
     this.fileMutationToolCallIds.delete(toolCallId)
     this.bashToolCallIds.delete(toolCallId)
     this.bashOutputSnapshots.delete(toolCallId)
-    this.subagentToolCallIds.delete(toolCallId)
+    this.streamedSubagentToolCallIds.delete(toolCallId)
+    if (this.subagentToolCallIds.delete(toolCallId)) {
+      this.activeSubagentToolCalls = Math.max(0, this.activeSubagentToolCalls - 1)
+    }
   }
 
   private async emitUsageUpdate(ev: PiRpcEvent): Promise<void> {
@@ -504,9 +515,25 @@ export class PiAcpSession {
     })
   }
 
+  private clearPendingUsage(): void {
+    this.pendingUsageEvent = null
+  }
+
+  // Reset all subagent tool-call tracking state. Must be called at the start of every
+  // new turn (and on cancellation/process failure) so a subagent tool call left
+  // dangling from a prior turn (e.g. aborted mid-execution with no `tool_execution_end`)
+  // cannot permanently suppress usage_update or streamed output in future turns.
+  private resetSubagentTracking(): void {
+    this.subagentToolCallIds.clear()
+    this.streamedSubagentToolCallIds.clear()
+    this.activeSubagentToolCalls = 0
+  }
+
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
     this.inAgentLoop = false
+    this.clearPendingUsage()
+    this.resetSubagentTracking()
 
     this.pendingTurn = { resolve: t.resolve, reject: t.reject }
 
@@ -534,6 +561,8 @@ export class PiAcpSession {
 
         this.pendingTurn = null
         this.inAgentLoop = false
+        this.clearPendingUsage()
+        this.resetSubagentTracking()
 
         // If the prompt failed, do not automatically proceed—pi may be unhealthy.
         // But we still clear the queueDepth metadata.
@@ -586,7 +615,15 @@ export class PiAcpSession {
           const toolName = String(toolCall.name ?? 'tool')
 
           if (toolCallId) {
-            if (toolName === 'subagent') this.subagentToolCallIds.add(toolCallId)
+            // Do NOT count this as an active subagent tool call here: `message_update`
+            // only reflects the model streaming a toolcall's arguments, not actual
+            // execution. If the call never reaches `tool_execution_start` (e.g. it is
+            // aborted before execution), incrementing here would leave the counter
+            // permanently stuck above zero with no corresponding cleanup event.
+            // Streamed-output suppression by id (see tool_execution_update/end) still
+            // needs to recognize a subagent call before execution starts, so track the
+            // id in a separate set that is not tied to the active-count invariant.
+            if (toolName === 'subagent') this.streamedSubagentToolCallIds.add(toolCallId)
             const rawInput =
               (toolCall as any)?.arguments && typeof (toolCall as any).arguments === 'object'
                 ? (toolCall as any).arguments
@@ -658,7 +695,12 @@ export class PiAcpSession {
         const toolCallId = String((ev as any).toolCallId ?? crypto.randomUUID())
         const toolName = String((ev as any).toolName ?? 'tool')
         const args = (ev as any).args
-        if (toolName === 'subagent') this.subagentToolCallIds.add(toolCallId)
+        // Count active subagents only once execution begins.
+        if (toolName === 'subagent' && !this.subagentToolCallIds.has(toolCallId)) {
+          this.subagentToolCallIds.add(toolCallId)
+          this.activeSubagentToolCalls += 1
+        }
+        this.streamedSubagentToolCallIds.delete(toolCallId)
         let line: number | undefined
 
         if (
@@ -741,7 +783,7 @@ export class PiAcpSession {
         if (!toolCallId) break
 
         const partial = (ev as any).partialResult
-        if (this.subagentToolCallIds.has(toolCallId)) break
+        if (this.subagentToolCallIds.has(toolCallId) || this.streamedSubagentToolCallIds.has(toolCallId)) break
         if (this.bashToolCallIds.has(toolCallId)) {
           this.emitBashOutputUpdate({ toolCallId, status: 'in_progress', result: partial })
           break
@@ -876,9 +918,12 @@ export class PiAcpSession {
       }
 
       case 'turn_end': {
-        const updatePromise = this.emitUsageUpdate(ev)
-        this.pendingUsageUpdates.add(updatePromise)
-        void updatePromise.finally(() => this.pendingUsageUpdates.delete(updatePromise))
+        // pi emits nested `turn_end` events for a subagent's own inner loop while a
+        // `subagent` tool call is executing. Those usage figures describe the child
+        // run, not the top-level conversation, so they must not be surfaced or buffered.
+        if (!this.cancelRequested && this.activeSubagentToolCalls === 0) {
+          this.pendingUsageEvent = ev
+        }
         // pi uses `turn_end` for sub-steps (e.g. tool_use) and will often start another turn.
         // Do NOT resolve the ACP `session/prompt` here; wait for `agent_settled`.
         break
@@ -892,9 +937,15 @@ export class PiAcpSession {
       }
 
       case 'agent_settled': {
+        // Emit at most one usage_update per prompt, from the latest buffered top-level
+        // turn_end, right before the ACP `session/prompt` request resolves.
+        const usageEvent = this.pendingUsageEvent
+        this.pendingUsageEvent = null
+        const usagePromise = usageEvent ? this.emitUsageUpdate(usageEvent) : Promise.resolve()
+
         // Ensure all updates derived from pi events are delivered before we resolve
         // the ACP `session/prompt` request.
-        void Promise.all(this.pendingUsageUpdates)
+        void usagePromise
           .then(() => this.flushEmits())
           .finally(() => {
             const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
