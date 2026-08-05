@@ -11,6 +11,7 @@ import type {
 import { RequestError } from '@agentclientprotocol/sdk'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { SessionStore } from './session-store.js'
@@ -50,6 +51,11 @@ type QueuedTurn = {
   reject: (err: unknown) => void
 }
 
+type ToolExecutionSnapshot = {
+  status: 'in_progress'
+  content: ToolCallContent[] | undefined
+}
+
 type PermissionResponse = Awaited<ReturnType<AgentSideConnection['requestPermission']>>
 
 const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
@@ -58,6 +64,10 @@ const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
 ]
 const EXTENSION_UI_RAW_INPUT_KEYS = ['title', 'message', 'options', 'placeholder', 'prefill'] as const
 const CHOICE_OPTION_PREFIX = 'choice-'
+
+function isToolUseProgress(text: string): boolean {
+  return /^\d+ tool uses\.\.\.$/.test(text)
+}
 
 function findUniqueLineNumber(text: string, needle: string): number | undefined {
   if (!needle) return undefined
@@ -297,6 +307,7 @@ export class PiAcpSession {
   private fileMutationToolCallIds = new Set<string>()
   private bashToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, string>()
+  private toolExecutionSnapshots = new Map<string, ToolExecutionSnapshot>()
 
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
@@ -437,6 +448,7 @@ export class PiAcpSession {
     includeTerminal: boolean
   }): void {
     this.bashToolCallIds.add(params.toolCallId)
+    this.toolExecutionSnapshots.delete(params.toolCallId)
     this.emit({
       sessionUpdate: params.sessionUpdate,
       toolCallId: params.toolCallId,
@@ -459,19 +471,39 @@ export class PiAcpSession {
     const previous = this.bashOutputSnapshots.get(params.toolCallId) ?? ''
     const delta = bashOutputDelta(previous, text)
     this.bashOutputSnapshots.set(params.toolCallId, text)
+    const content = text
+      ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
+      : undefined
+    const snapshot = { status: 'in_progress' as const, content }
 
-    this.emit({
-      sessionUpdate: 'tool_call_update',
-      toolCallId: params.toolCallId,
-      status: params.status,
-      content: text ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[]) : undefined,
-      _meta: {
-        ...(delta ? bashTerminalOutputMeta(params.toolCallId, delta) : {}),
-        ...(params.status === 'completed' || params.status === 'failed'
-          ? bashTerminalExitMeta(params.toolCallId, bashExitCode(params.result, Boolean(params.isError)))
-          : {})
-      }
-    })
+    if (params.status === 'in_progress' && this.shouldEmitToolExecutionUpdate(params.toolCallId, snapshot)) {
+      this.emit({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: params.toolCallId,
+        status: params.status,
+        content,
+        _meta: {
+          ...(delta ? bashTerminalOutputMeta(params.toolCallId, delta) : {})
+        }
+      })
+    } else if (params.status !== 'in_progress') {
+      this.emit({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: params.toolCallId,
+        status: params.status,
+        content,
+        _meta: {
+          ...(delta ? bashTerminalOutputMeta(params.toolCallId, delta) : {}),
+          ...bashTerminalExitMeta(params.toolCallId, bashExitCode(params.result, Boolean(params.isError)))
+        }
+      })
+    }
+  }
+
+  private shouldEmitToolExecutionUpdate(toolCallId: string, snapshot: ToolExecutionSnapshot): boolean {
+    if (isDeepStrictEqual(this.toolExecutionSnapshots.get(toolCallId), snapshot)) return false
+    this.toolExecutionSnapshots.set(toolCallId, snapshot)
+    return true
   }
 
   private cleanupToolCall(toolCallId: string): void {
@@ -480,6 +512,7 @@ export class PiAcpSession {
     this.fileMutationToolCallIds.delete(toolCallId)
     this.bashToolCallIds.delete(toolCallId)
     this.bashOutputSnapshots.delete(toolCallId)
+    this.toolExecutionSnapshots.delete(toolCallId)
     this.streamedSubagentToolCallIds.delete(toolCallId)
     if (this.subagentToolCallIds.delete(toolCallId)) {
       this.activeSubagentToolCalls = Math.max(0, this.activeSubagentToolCalls - 1)
@@ -526,6 +559,7 @@ export class PiAcpSession {
   private resetSubagentTracking(): void {
     this.subagentToolCallIds.clear()
     this.streamedSubagentToolCallIds.clear()
+    this.toolExecutionSnapshots.clear()
     this.activeSubagentToolCalls = 0
   }
 
@@ -766,6 +800,7 @@ export class PiAcpSession {
           })
         } else {
           this.currentToolCalls.set(toolCallId, 'in_progress')
+          this.toolExecutionSnapshots.delete(toolCallId)
           this.emit({
             sessionUpdate: 'tool_call_update',
             toolCallId,
@@ -790,15 +825,23 @@ export class PiAcpSession {
         }
 
         const text = this.fileMutationToolCallIds.has(toolCallId) ? '' : toolResultToText(partial)
+        const isProgress = isToolUseProgress(text)
+        const visibleText = isProgress ? '' : text
+        const content = visibleText
+          ? ([{ type: 'content', content: { type: 'text', text: visibleText } }] satisfies ToolCallContent[])
+          : undefined
+        const snapshot: ToolExecutionSnapshot = {
+          status: 'in_progress',
+          content
+        }
 
+        if (!this.shouldEmitToolExecutionUpdate(toolCallId, snapshot)) break
         this.emit({
           sessionUpdate: 'tool_call_update',
           toolCallId,
           status: 'in_progress',
-          content: text
-            ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
-            : undefined,
-          ...(this.fileMutationToolCallIds.has(toolCallId) ? {} : { rawOutput: partial })
+          ...(content ? { content } : {}),
+          ...(this.fileMutationToolCallIds.has(toolCallId) || isProgress ? {} : { rawOutput: partial })
         })
         break
       }
