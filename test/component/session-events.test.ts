@@ -444,6 +444,106 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
   assert.equal((conn.updates[2]!.update as any).rawOutput, undefined)
 })
 
+test('PiAcpSession: suppresses consecutive identical tool execution snapshots', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const first = { content: [{ type: 'text', text: '0 tool uses...' }], details: { progress: 1 } }
+  const duplicateVisibleText = { content: [{ type: 'text', text: '0 tool uses...' }], details: { progress: 2 } }
+  const changed = { content: [{ type: 'text', text: '1 tool uses...' }] }
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'read', args: { path: 'README.md' } })
+  proc.emit({ type: 'tool_execution_update', toolCallId: 't1', partialResult: first })
+  proc.emit({ type: 'tool_execution_update', toolCallId: 't1', partialResult: duplicateVisibleText })
+  proc.emit({ type: 'tool_execution_update', toolCallId: 't1', partialResult: changed })
+  proc.emit({ type: 'tool_execution_end', toolCallId: 't1', isError: false, result: changed })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.deepEqual(
+    conn.updates.map(entry => entry.update),
+    [
+      {
+        sessionUpdate: 'tool_call',
+        toolCallId: 't1',
+        title: 'read README.md',
+        kind: 'read',
+        status: 'in_progress',
+        locations: [{ path: `${process.cwd()}/README.md` }],
+        rawInput: { path: 'README.md' }
+      },
+      {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 't1',
+        status: 'in_progress'
+      },
+      {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 't1',
+        status: 'completed',
+        content: [{ type: 'content', content: { type: 'text', text: '1 tool uses...' } }],
+        rawOutput: changed
+      }
+    ]
+  )
+})
+
+test('PiAcpSession: suppresses tool use progress snapshots', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 't1',
+    toolName: 'read',
+    args: { path: 'README.md' }
+  })
+  for (const text of ['0 tool uses...', '1 tool uses...', '2 tool uses...']) {
+    proc.emit({
+      type: 'tool_execution_update',
+      toolCallId: 't1',
+      partialResult: { content: [{ type: 'text', text }] }
+    })
+  }
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 't1',
+    isError: false,
+    result: { content: [{ type: 'text', text: 'done' }] }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 3)
+  assert.equal((conn.updates[1]!.update as any).sessionUpdate, 'tool_call_update')
+  assert.equal((conn.updates[1]!.update as any).status, 'in_progress')
+  assert.equal((conn.updates[1]!.update as any).content, undefined)
+  assert.equal((conn.updates[1]!.update as any).rawOutput, undefined)
+  assert.deepEqual((conn.updates[2]!.update as any).content, [
+    { type: 'content', content: { type: 'text', text: 'done' } }
+  ])
+  assert.deepEqual((conn.updates[2]!.update as any).rawOutput, {
+    content: [{ type: 'text', text: 'done' }]
+  })
+})
+
 test('PiAcpSession: merges direct and partial streamed tool-call fields', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
