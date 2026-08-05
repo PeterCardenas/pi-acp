@@ -74,6 +74,245 @@ test('PiAcpSession: translates turn_end usage into ACP usage_update', async () =
   })
 })
 
+test('PiAcpSession: emits only one usage_update per prompt, using the latest top-level turn_end', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.getState = async () => ({ model: { contextWindow: 8192 } })
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'turn_end', message: { usage: { input: 100 }, contextWindow: 8192 } })
+  proc.emit({ type: 'turn_end', message: { usage: { input: 200 }, contextWindow: 8192 } })
+  proc.emit({ type: 'turn_end', message: { usage: { input: 300 }, contextWindow: 8192 } })
+  proc.emit({ type: 'agent_settled' })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const usageUpdates = conn.updates.filter(update => update.update.sessionUpdate === 'usage_update')
+  assert.equal(usageUpdates.length, 1)
+  assert.deepEqual(usageUpdates[0]!.update, {
+    sessionUpdate: 'usage_update',
+    used: 300,
+    size: 8192
+  })
+})
+
+test('PiAcpSession: suppresses usage_update from turn_end while a subagent tool call is executing', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.getState = async () => ({ model: { contextWindow: 8192 } })
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'subagent-1',
+    toolName: 'subagent',
+    args: { task: 'inspect' }
+  })
+
+  // Nested turn_end events from the subagent's own inner loop should not surface usage.
+  proc.emit({ type: 'turn_end', message: { usage: { input: 999 }, contextWindow: 8192 } })
+  proc.emit({ type: 'turn_end', message: { usage: { input: 1500 }, contextWindow: 8192 } })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const result = { content: [{ type: 'text', text: 'subagent done' }] }
+  proc.emit({ type: 'tool_execution_end', toolCallId: 'subagent-1', isError: false, result })
+
+  // The top-level turn_end after the subagent tool completes should be honored.
+  proc.emit({ type: 'turn_end', message: { usage: { input: 42 }, contextWindow: 8192 } })
+  proc.emit({ type: 'agent_settled' })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const usageUpdates = conn.updates.filter(update => update.update.sessionUpdate === 'usage_update')
+  assert.equal(usageUpdates.length, 1)
+  assert.deepEqual(usageUpdates[0]!.update, {
+    sessionUpdate: 'usage_update',
+    used: 42,
+    size: 8192
+  })
+})
+
+test('PiAcpSession: clears buffered usage on prompt failure and does not leak into next turn', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.getState = async () => ({ model: { contextWindow: 8192 } })
+
+  // Make proc.prompt reject for the very first turn, so the failure-handling path
+  // (not the normal agent_settled path) is what actually runs for this turn.
+  proc.prompt = async () => {
+    throw new Error('boom')
+  }
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const first = session.prompt('one')
+  // Buffer usage before the proc.prompt rejection is handled, to prove the
+  // failure path clears it rather than merely never having anything buffered.
+  proc.emit({ type: 'turn_end', message: { usage: { input: 777 }, contextWindow: 8192 } })
+
+  const firstReason = await first
+  assert.equal(firstReason, 'error')
+
+  await new Promise(r => setTimeout(r, 0))
+  conn.updates.length = 0
+
+  // Restore a working proc.prompt for the next turn.
+  proc.prompt = async () => {}
+
+  const second = session.prompt('two')
+  proc.emit({ type: 'agent_settled' })
+  await second
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const usageUpdates = conn.updates.filter(update => update.update.sessionUpdate === 'usage_update')
+  assert.equal(usageUpdates.length, 0)
+})
+
+test('PiAcpSession: only tool_execution_start marks a subagent tool call active, not streamed message_update toolcall events', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.getState = async () => ({ model: { contextWindow: 8192 } })
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  // Model streams a subagent toolcall via message_update, but execution never
+  // actually starts (e.g. the call is aborted before `tool_execution_start`).
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_start',
+      toolCall: { id: 'subagent-1', name: 'subagent', arguments: { task: 'inspect' } }
+    }
+  })
+
+  // A legitimate top-level turn_end should NOT be suppressed just because a
+  // subagent toolcall was streamed in a message_update.
+  proc.emit({ type: 'turn_end', message: { usage: { input: 55 }, contextWindow: 8192 } })
+  proc.emit({ type: 'agent_settled' })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const usageUpdates = conn.updates.filter(update => update.update.sessionUpdate === 'usage_update')
+  assert.equal(usageUpdates.length, 1)
+  assert.deepEqual(usageUpdates[0]!.update, {
+    sessionUpdate: 'usage_update',
+    used: 55,
+    size: 8192
+  })
+})
+
+test('PiAcpSession: cancelling mid-subagent-tool-call does not permanently suppress usage in the next turn', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.getState = async () => ({ model: { contextWindow: 8192 } })
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const first = session.prompt('one')
+
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'subagent-1',
+    toolName: 'subagent',
+    args: { task: 'inspect' }
+  })
+
+  // Cancel while the subagent tool call is still in flight; no tool_execution_end
+  // ever arrives for it, so cleanupToolCall-based decrement never runs.
+  await session.cancel()
+  proc.emit({ type: 'agent_settled' })
+  await first
+
+  await new Promise(r => setTimeout(r, 0))
+  conn.updates.length = 0
+
+  const second = session.prompt('two')
+  proc.emit({ type: 'turn_end', message: { usage: { input: 88 }, contextWindow: 8192 } })
+  proc.emit({ type: 'agent_settled' })
+  await second
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const usageUpdates = conn.updates.filter(update => update.update.sessionUpdate === 'usage_update')
+  assert.equal(usageUpdates.length, 1)
+  assert.deepEqual(usageUpdates[0]!.update, {
+    sessionUpdate: 'usage_update',
+    used: 88,
+    size: 8192
+  })
+})
+
+test('PiAcpSession: ignores turn_end usage received after cancel for the cancelled prompt', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.getState = async () => ({ model: { contextWindow: 8192 } })
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const first = session.prompt('one')
+
+  await session.cancel()
+
+  // A late `turn_end` for the already-cancelled prompt arrives before `agent_settled`
+  // (e.g. a nested child run finishing after abort). Its usage must not be buffered
+  // or emitted for this cancelled prompt.
+  proc.emit({ type: 'turn_end', message: { usage: { input: 999 }, contextWindow: 8192 } })
+  proc.emit({ type: 'agent_settled' })
+  const reason = await first
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(reason, 'cancelled')
+  const usageUpdates = conn.updates.filter(update => update.update.sessionUpdate === 'usage_update')
+  assert.equal(usageUpdates.length, 0)
+})
+
 test('PiAcpSession: emits agent_thought_chunk for thinking_delta', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
