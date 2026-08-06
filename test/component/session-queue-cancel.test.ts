@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { PiAcpSession } from '../../src/acp/session.js'
-import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
+import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn, asPiRpcProcess } from '../helpers/fakes.js'
 
 test('PiAcpSession: cancel clears queued prompts', async () => {
   const conn = new FakeAgentSideConnection()
@@ -11,7 +11,7 @@ test('PiAcpSession: cancel clears queued prompts', async () => {
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -40,4 +40,26 @@ test('PiAcpSession: cancel clears queued prompts', async () => {
 
   // queue should have been cleared, so no further prompt started
   assert.equal(proc.prompts.length, 1)
+})
+
+test('PiAcpSession: abort failure rejects the active prompt and cancel', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const abortError = new Error('abort failed')
+  proc.abort = async () => {
+    throw abortError
+  }
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: asPiRpcProcess(proc),
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const prompt = session.prompt('one')
+  await assert.rejects(session.cancel(), abortError)
+  await assert.rejects(prompt, abortError)
 })

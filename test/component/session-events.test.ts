@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PiAcpSession } from '../../src/acp/session.js'
-import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
+import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn, asPiRpcProcess } from '../helpers/fakes.js'
 
 test('PiAcpSession: emits agent_message_chunk for text_delta', async () => {
   const conn = new FakeAgentSideConnection()
@@ -14,7 +14,7 @@ test('PiAcpSession: emits agent_message_chunk for text_delta', async () => {
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -34,16 +34,182 @@ test('PiAcpSession: emits agent_message_chunk for text_delta', async () => {
   })
 })
 
-test('PiAcpSession: translates turn_end usage into ACP usage_update', async () => {
+test('PiAcpSession: uses session stats for ACP usage_update', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
   proc.getState = async () => ({ model: { contextWindow: 8192 } })
+  proc.getSessionStats = async () => ({
+    tokens: { input: 4321 },
+    cost: 7.5,
+    contextUsage: { tokens: 4321, contextWindow: 16384, percent: 26.3 }
+  })
 
   new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+  proc.emit({ type: 'turn_end', message: { usage: { input: 12, cost: { total: 0.1 } }, contextWindow: 8192 } })
+  proc.emit({ type: 'agent_settled' })
+  await new Promise(r => setTimeout(r, 0))
+  assert.deepEqual(conn.updates.find(update => update.update.sessionUpdate === 'usage_update')?.update, {
+    sessionUpdate: 'usage_update',
+    used: 4321,
+    size: 16384,
+    cost: { amount: 7.5, currency: 'USD' }
+  })
+})
+
+test('PiAcpSession: omits invalid cost while preserving valid context stats', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.getSessionStats = async () => ({
+    tokens: { input: 10 },
+    contextUsage: { tokens: 10, contextWindow: 100, percent: 10 },
+    cost: Number.NaN
+  })
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: asPiRpcProcess(proc),
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+  proc.emit({ type: 'turn_end', message: {} })
+  proc.emit({ type: 'agent_settled' })
+  await new Promise(r => setTimeout(r, 0))
+  assert.deepEqual(conn.updates.find(update => update.update.sessionUpdate === 'usage_update')?.update, {
+    sessionUpdate: 'usage_update',
+    used: 10,
+    size: 100
+  })
+})
+
+test('PiAcpSession: emits valid zero cumulative cost', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.getSessionStats = async () => ({
+    tokens: { input: 0 },
+    contextUsage: { tokens: 0, contextWindow: 100, percent: 0 },
+    cost: 0
+  })
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: asPiRpcProcess(proc),
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+  proc.emit({ type: 'turn_end', message: {} })
+  proc.emit({ type: 'agent_settled' })
+  await new Promise(r => setTimeout(r, 0))
+  assert.deepEqual(conn.updates.find(update => update.update.sessionUpdate === 'usage_update')?.update, {
+    sessionUpdate: 'usage_update',
+    used: 0,
+    size: 100,
+    cost: { amount: 0, currency: 'USD' }
+  })
+})
+
+test('PiAcpSession: settles prompt without usage_update when getSessionStats rejects', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.getSessionStats = async () => {
+    throw new Error('stats unavailable')
+  }
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: asPiRpcProcess(proc),
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const settled = session.prompt('hello')
+  proc.emit({ type: 'turn_end', message: {} })
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await settled, 'end_turn')
+  assert.equal(
+    conn.updates.some(update => update.update.sessionUpdate === 'usage_update'),
+    false
+  )
+})
+
+test('PiAcpSession: settles prompt without usage_update when getSessionStats never resolves', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  let signal: AbortSignal | undefined
+  proc.getSessionStats = async receivedSignal => {
+    signal = receivedSignal
+    return await new Promise<unknown>(() => {})
+  }
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: asPiRpcProcess(proc),
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const settled = session.prompt('hello')
+  proc.emit({ type: 'turn_end', message: {} })
+  proc.emit({ type: 'agent_settled' })
+  const result = await Promise.race([
+    settled,
+    new Promise<'timeout'>(resolve => setTimeout(() => resolve('timeout'), 250))
+  ])
+
+  assert.equal(result, 'end_turn')
+  assert.equal(signal?.aborted, true)
+  assert.equal(
+    conn.updates.some(update => update.update.sessionUpdate === 'usage_update'),
+    false
+  )
+})
+
+test('PiAcpSession: settles prompt without usage_update when context tokens are missing', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.sessionStats = { contextUsage: { contextWindow: 8192 }, cost: 1 }
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: asPiRpcProcess(proc),
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const settled = session.prompt('hello')
+  proc.emit({ type: 'turn_end', message: {} })
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await settled, 'end_turn')
+  assert.equal(
+    conn.updates.some(update => update.update.sessionUpdate === 'usage_update'),
+    false
+  )
+})
+
+test('PiAcpSession: translates turn_end usage into ACP usage_update', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.getState = async () => ({ model: { contextWindow: 8192 } })
+  proc.sessionStats = { contextUsage: { tokens: 1234, contextWindow: 8192 }, cost: 0.03 }
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -78,12 +244,13 @@ test('PiAcpSession: emits only one usage_update per prompt, using the latest top
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
   proc.getState = async () => ({ model: { contextWindow: 8192 } })
+  proc.sessionStats = { contextUsage: { tokens: 300, contextWindow: 8192 } }
 
   new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -108,12 +275,13 @@ test('PiAcpSession: suppresses usage_update from turn_end while a subagent tool 
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
   proc.getState = async () => ({ model: { contextWindow: 8192 } })
+  proc.sessionStats = { contextUsage: { tokens: 42, contextWindow: 8192 } }
 
   new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -164,7 +332,7 @@ test('PiAcpSession: clears buffered usage on prompt failure and does not leak in
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -197,12 +365,13 @@ test('PiAcpSession: only tool_execution_start marks a subagent tool call active,
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
   proc.getState = async () => ({ model: { contextWindow: 8192 } })
+  proc.sessionStats = { contextUsage: { tokens: 55, contextWindow: 8192 } }
 
   new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -237,12 +406,13 @@ test('PiAcpSession: cancelling mid-subagent-tool-call does not permanently suppr
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
   proc.getState = async () => ({ model: { contextWindow: 8192 } })
+  proc.sessionStats = { contextUsage: { tokens: 88, contextWindow: 8192 } }
 
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -290,7 +460,7 @@ test('PiAcpSession: ignores turn_end usage received after cancel for the cancell
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -321,7 +491,7 @@ test('PiAcpSession: emits agent_thought_chunk for thinking_delta', async () => {
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -349,7 +519,7 @@ test('PiAcpSession: waits for non-empty streamed arguments before rendering file
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -386,7 +556,7 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -444,6 +614,50 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
   assert.equal((conn.updates[2]!.update as any).rawOutput, undefined)
 })
 
+test('PiAcpSession: emits non-bash tool partial output chunks instead of cumulative snapshots', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: asPiRpcProcess(proc),
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'read', args: { path: 'README.md' } })
+  for (const text of ['a', 'ab', 'abc']) {
+    proc.emit({
+      type: 'tool_execution_update',
+      toolCallId: 't1',
+      partialResult: { content: [{ type: 'text', text }] }
+    })
+  }
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 't1',
+    isError: false,
+    result: { content: [{ type: 'text', text: 'done' }] }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const partialOutput = conn.updates
+    .filter(update => update.update.sessionUpdate === 'tool_call_update' && update.update.status === 'in_progress')
+    .map(update => {
+      const content =
+        'content' in update.update && Array.isArray(update.update.content) ? update.update.content[0] : undefined
+      return content?.type === 'content' ? content.content : undefined
+    })
+  assert.deepEqual(partialOutput, [
+    { type: 'text', text: 'a' },
+    { type: 'text', text: 'b' },
+    { type: 'text', text: 'c' }
+  ])
+})
+
 test('PiAcpSession: suppresses consecutive identical tool execution snapshots', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
@@ -452,7 +666,7 @@ test('PiAcpSession: suppresses consecutive identical tool execution snapshots', 
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -504,7 +718,7 @@ test('PiAcpSession: suppresses tool use progress snapshots', async () => {
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -551,7 +765,7 @@ test('PiAcpSession: merges direct and partial streamed tool-call fields', async 
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -579,7 +793,7 @@ test('PiAcpSession: tracks subagent across cumulative partial snapshots despite 
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -620,7 +834,7 @@ test('PiAcpSession: suppresses streamed subagent updates by tracked id', async (
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -693,7 +907,7 @@ test('PiAcpSession: renders a complete streamed bash title once', async () => {
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -725,7 +939,7 @@ test('PiAcpSession: waits for streamed edit arguments before rendering its title
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -749,7 +963,7 @@ test('PiAcpSession: emits useful read tool title, location, and output', async (
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -788,7 +1002,7 @@ test('PiAcpSession: handles extension select via ACP permission request', async 
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -830,7 +1044,7 @@ test('PiAcpSession: handles extension confirm via ACP permission request', async
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -862,7 +1076,7 @@ test('PiAcpSession: sends cancelled response when ACP confirm is cancelled', asy
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -882,7 +1096,7 @@ test('PiAcpSession: cancels unsupported input and editor extension UI requests w
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -909,7 +1123,7 @@ test('PiAcpSession: emits agent_message_chunk for auto_retry_start with attempt/
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -933,7 +1147,7 @@ test('PiAcpSession: formats a positive sub-second auto_retry_start delay as wait
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -957,7 +1171,7 @@ test('PiAcpSession: falls back to a generic retry message when auto_retry_start 
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -981,7 +1195,7 @@ test('PiAcpSession: omits raw errorMessage content from surfaced auto_retry_star
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -1010,7 +1224,7 @@ test('PiAcpSession: emits agent_message_chunk for auto_retry_end', async () => {
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -1034,7 +1248,7 @@ test('PiAcpSession: emits agent_message_chunk for auto_compaction_start', async 
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -1058,7 +1272,7 @@ test('PiAcpSession: emits agent_message_chunk for auto_compaction_end', async ()
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -1085,7 +1299,7 @@ test('PiAcpSession: preserves ordering when auto_retry_start is interleaved with
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -1117,7 +1331,7 @@ test('PiAcpSession: emits streamed tool locations from pi path args', async () =
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -1154,7 +1368,7 @@ test('PiAcpSession: emits edit tool line when oldText matches uniquely', async (
     sessionId: 's1',
     cwd,
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -1186,7 +1400,7 @@ test('PiAcpSession: emits edit tool line from edits array when oldText matches u
     sessionId: 's1',
     cwd,
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -1218,7 +1432,7 @@ test('PiAcpSession: emits edit tool line from stringified edits array', async ()
     sessionId: 's1',
     cwd,
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -1250,7 +1464,7 @@ test('PiAcpSession: omits edit tool line when oldText matches multiple times', a
     sessionId: 's1',
     cwd,
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -1277,7 +1491,7 @@ test('PiAcpSession: prompt stays open through retry runs until agent_settled', a
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -1313,7 +1527,7 @@ test('PiAcpSession: does not re-emit startup info on first prompt after it was a
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -1354,7 +1568,7 @@ test('PiAcpSession: cancel flips stopReason to cancelled', async () => {
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -1379,7 +1593,7 @@ test('PiAcpSession: queues concurrent prompt and starts it after agent_settled',
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -1410,6 +1624,38 @@ test('PiAcpSession: queues concurrent prompt and starts it after agent_settled',
   assert.equal(r2, 'end_turn')
 })
 
+test('PiAcpSession: ignores settlement after the queued turn has started', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: asPiRpcProcess(proc),
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const first = session.prompt('one')
+  await session.cancel()
+  const second = session.prompt('two')
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await first, 'cancelled')
+  assert.equal(proc.prompts.length, 2)
+  proc.emit({ type: 'agent_start' })
+  let secondSettled = false
+  void second.then(() => {
+    secondSettled = true
+  })
+  await Promise.resolve()
+  assert.equal(secondSettled, false)
+  proc.emit({ type: 'turn_end' })
+  proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await second, 'end_turn')
+})
+
 test('PiAcpSession: cancel clears queued prompts', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
@@ -1418,7 +1664,7 @@ test('PiAcpSession: cancel clears queued prompts', async () => {
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -1449,7 +1695,7 @@ test('PiAcpSession: expands /command before sending to pi', async () => {
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: [
       {
@@ -1482,7 +1728,7 @@ test('PiAcpSession: tags extension notify chunks with severity in _meta', async 
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
@@ -1514,7 +1760,7 @@ test('PiAcpSession: defaults notify severity to info when notifyType is absent',
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
-    proc: proc as any,
+    proc: asPiRpcProcess(proc),
     conn: asAgentConn(conn),
     fileCommands: []
   })
