@@ -282,8 +282,8 @@ export class PiRpcProcess {
     if (!res.success) throw new Error(`pi set_auto_compaction failed: ${res.error ?? JSON.stringify(res.data)}`)
   }
 
-  async getSessionStats(): Promise<unknown> {
-    const res = await this.request({ type: 'get_session_stats' })
+  async getSessionStats(signal?: AbortSignal): Promise<unknown> {
+    const res = await this.request({ type: 'get_session_stats' }, signal)
     if (!res.success) throw new Error(`pi get_session_stats failed: ${res.error ?? JSON.stringify(res.data)}`)
     return res.data
   }
@@ -321,19 +321,32 @@ export class PiRpcProcess {
     await this.writeLine(`${JSON.stringify({ type: 'extension_ui_response', ...response })}\n`)
   }
 
-  private request(cmd: PiRpcCommand): Promise<PiRpcResponse> {
+  private request(cmd: PiRpcCommand, signal?: AbortSignal): Promise<PiRpcResponse> {
     const id = crypto.randomUUID()
     const withId = { ...cmd, id }
 
     const line = `${JSON.stringify(withId)}\n`
 
     return new Promise<PiRpcResponse>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
-
-      void this.writeLine(line).catch(error => {
+      let settled = false
+      const finish = (fn: () => void) => {
+        if (settled) return
+        settled = true
         this.pending.delete(id)
-        reject(error)
+        signal?.removeEventListener('abort', cancel)
+        fn()
+      }
+      const cancel = () => finish(() => reject(new DOMException('The operation was aborted', 'AbortError')))
+      this.pending.set(id, {
+        resolve: value => finish(() => resolve(value)),
+        reject: error => finish(() => reject(error))
       })
+      if (signal?.aborted) {
+        cancel()
+        return
+      }
+      signal?.addEventListener('abort', cancel, { once: true })
+      void this.writeLine(line).catch(error => finish(() => reject(error)))
     })
   }
 
