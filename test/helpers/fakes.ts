@@ -1,5 +1,5 @@
 import type { AgentSideConnection } from '@agentclientprotocol/sdk'
-import type { PiRpcEvent } from '../../src/pi-rpc/process.js'
+import type { PiRpcEvent, PiRpcProcess } from '../../src/pi-rpc/process.js'
 
 type SessionUpdateMsg = Parameters<AgentSideConnection['sessionUpdate']>[0]
 
@@ -24,6 +24,11 @@ export class FakeAgentSideConnection {
 
 export class FakePiRpcProcess {
   private handlers: Array<(ev: PiRpcEvent) => void> = []
+  sessionStats: unknown = {
+    tokens: { input: 0 },
+    cost: 0,
+    contextUsage: { tokens: 0, contextWindow: 8192, percent: 0 }
+  }
 
   // spies
   readonly prompts: Array<{ message: string; attachments: unknown[] }> = []
@@ -53,17 +58,25 @@ export class FakePiRpcProcess {
     this.extensionUiResponses.push(response)
   }
 
-  async getState(): Promise<any> {
+  async getState(): Promise<unknown> {
     return {}
   }
 
-  async getAvailableModels(): Promise<any> {
+  async getSessionStats(_signal?: AbortSignal): Promise<unknown> {
+    return this.sessionStats
+  }
+
+  async getAvailableModels(): Promise<unknown> {
     return { models: [{ provider: 'test', id: 'model', name: 'model' }] }
   }
 
-  async getMessages(): Promise<any> {
+  async getMessages(): Promise<unknown> {
     return { messages: [] }
   }
+}
+
+export function asPiRpcProcess(proc: FakePiRpcProcess): PiRpcProcess {
+  return proc as unknown as PiRpcProcess
 }
 
 export function asAgentConn(conn: FakeAgentSideConnection): AgentSideConnection {

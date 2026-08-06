@@ -9,6 +9,10 @@ import type {
   ToolKind
 } from '@agentclientprotocol/sdk'
 import { RequestError } from '@agentclientprotocol/sdk'
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
 import { readFileSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
@@ -279,6 +283,8 @@ export class PiAcpSession {
   // Used to map abort semantics to ACP stopReason.
   // Applies to the currently running turn.
   private cancelRequested = false
+  // A cancelled turn remains active until Pi emits its terminal agent_settled.
+  private cancelledPendingTurn = false
 
   // Current in-flight turn (if any). Additional prompts are queued.
   private pendingTurn: PendingTurn | null = null
@@ -308,6 +314,7 @@ export class PiAcpSession {
   private bashToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, string>()
   private toolExecutionSnapshots = new Map<string, ToolExecutionSnapshot>()
+  private toolExecutionOutputs = new Map<string, string>()
 
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
@@ -391,7 +398,14 @@ export class PiAcpSession {
 
   async cancel(): Promise<void> {
     // Cancel current and clear any queued prompts.
+    if (!this.pendingTurn) {
+      // There is no lifecycle to cancel. Keep queued work deterministic.
+      const queued = this.turnQueue.splice(0, this.turnQueue.length)
+      for (const t of queued) t.resolve('cancelled')
+      return
+    }
     this.cancelRequested = true
+    this.cancelledPendingTurn = true
     // A subagent tool call may be left in flight with no `tool_execution_end` ever
     // arriving once aborted; clear tracking now instead of relying on cleanup that
     // may never run for it.
@@ -411,8 +425,22 @@ export class PiAcpSession {
       })
     }
 
-    // Abort the currently running turn (if any). If nothing is running, this is a no-op.
-    await this.proc.abort()
+    // Abort the currently running turn. If abort itself fails, reject the active
+    // prompt and queued callers rather than reporting cancellation we could not perform.
+    try {
+      await this.proc.abort()
+    } catch (err) {
+      const current = this.pendingTurn
+      this.pendingTurn = null
+      current?.reject(err)
+      for (const t of this.turnQueue.splice(0)) t.reject(err)
+      this.cancelledPendingTurn = false
+      this.cancelRequested = false
+      this.inAgentLoop = false
+      this.clearPendingUsage()
+      this.resetSubagentTracking()
+      throw err
+    }
   }
 
   wasCancelRequested(): boolean {
@@ -513,38 +541,45 @@ export class PiAcpSession {
     this.bashToolCallIds.delete(toolCallId)
     this.bashOutputSnapshots.delete(toolCallId)
     this.toolExecutionSnapshots.delete(toolCallId)
+    this.toolExecutionOutputs.delete(toolCallId)
     this.streamedSubagentToolCallIds.delete(toolCallId)
     if (this.subagentToolCallIds.delete(toolCallId)) {
       this.activeSubagentToolCalls = Math.max(0, this.activeSubagentToolCalls - 1)
     }
   }
 
-  private async emitUsageUpdate(ev: PiRpcEvent): Promise<void> {
-    const message = (ev as { message?: unknown }).message as
-      { usage?: { input?: unknown; cost?: { total?: unknown } }; contextWindow?: unknown } | undefined
-    const usage = message?.usage
-    if (typeof usage?.input !== 'number') return
-
-    let contextWindow: number | undefined =
-      typeof message?.contextWindow === 'number' ? message.contextWindow : undefined
-    if (contextWindow === undefined) {
-      try {
-        const state = (await this.proc.getState()) as { model?: { contextWindow?: unknown } }
-        if (typeof state.model?.contextWindow === 'number') contextWindow = state.model.contextWindow
-      } catch {
-        return
-      }
+  // get_session_stats is required for correct ACP semantics; stats failures omit the
+  // update rather than fabricate non-cumulative values.
+  private async emitUsageUpdate(): Promise<void> {
+    const controller = new AbortController()
+    // Bound optional reporting so prompt completion is never held by an unresponsive local RPC.
+    const usageReportingTimeoutMs = 100
+    const timer = setTimeout(() => controller.abort(), usageReportingTimeoutMs)
+    let stats: unknown
+    try {
+      stats = await Promise.race([
+        this.proc.getSessionStats(controller.signal),
+        new Promise<never>((_, reject) => {
+          controller.signal.addEventListener('abort', () => reject(new Error('stats timeout')), { once: true })
+        })
+      ])
+    } catch {
+      return
+    } finally {
+      clearTimeout(timer)
     }
-    if (contextWindow === undefined || contextWindow <= 0) return
-
-    const inputTokens = usage.input
-    if (typeof inputTokens !== 'number') return
-    const totalCost = usage.cost?.total
+    if (!isRecord(stats) || !isRecord(stats.contextUsage)) return
+    const used = stats.contextUsage.tokens
+    const size = stats.contextUsage.contextWindow
+    if (typeof used !== 'number' || !Number.isFinite(used) || used < 0) return
+    if (typeof size !== 'number' || !Number.isFinite(size) || size <= 0) return
+    const cost = stats.cost
+    const validCost = typeof cost === 'number' && Number.isFinite(cost) && cost >= 0
     this.emit({
       sessionUpdate: 'usage_update',
-      used: inputTokens,
-      size: contextWindow,
-      ...(typeof totalCost === 'number' ? { cost: { amount: totalCost, currency: 'USD' } } : {})
+      used,
+      size,
+      ...(validCost ? { cost: { amount: cost, currency: 'USD' } } : {})
     })
   }
 
@@ -560,6 +595,7 @@ export class PiAcpSession {
     this.subagentToolCallIds.clear()
     this.streamedSubagentToolCallIds.clear()
     this.toolExecutionSnapshots.clear()
+    this.toolExecutionOutputs.clear()
     this.activeSubagentToolCalls = 0
   }
 
@@ -570,6 +606,7 @@ export class PiAcpSession {
     this.resetSubagentTracking()
 
     this.pendingTurn = { resolve: t.resolve, reject: t.reject }
+    this.cancelledPendingTurn = false
 
     // Publish queue depth (0 because we're starting the turn now).
     this.emit({
@@ -586,14 +623,13 @@ export class PiAcpSession {
       void this.flushEmits().finally(() => {
         // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
         const authErr = maybeAuthRequiredError(err)
-        if (authErr) {
-          this.pendingTurn?.reject(authErr)
-        } else {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
-          this.pendingTurn?.resolve(reason)
-        }
-
+        const current = this.pendingTurn
         this.pendingTurn = null
+        if (authErr) current?.reject(authErr)
+        else current?.resolve(this.cancelRequested ? 'cancelled' : 'error')
+        for (const queued of this.turnQueue.splice(0)) queued.reject(err)
+        this.cancelledPendingTurn = false
+        this.cancelRequested = false
         this.inAgentLoop = false
         this.clearPendingUsage()
         this.resetSubagentTracking()
@@ -801,6 +837,7 @@ export class PiAcpSession {
         } else {
           this.currentToolCalls.set(toolCallId, 'in_progress')
           this.toolExecutionSnapshots.delete(toolCallId)
+          this.toolExecutionOutputs.delete(toolCallId)
           this.emit({
             sessionUpdate: 'tool_call_update',
             toolCallId,
@@ -826,7 +863,14 @@ export class PiAcpSession {
 
         const text = this.fileMutationToolCallIds.has(toolCallId) ? '' : toolResultToText(partial)
         const isProgress = isToolUseProgress(text)
-        const visibleText = isProgress ? '' : text
+        const previous = this.toolExecutionOutputs.get(toolCallId) ?? ''
+        if (!isProgress && text === previous) break
+        const visibleText = isProgress
+          ? ''
+          : text.startsWith(previous) && text.length >= previous.length
+            ? text.slice(previous.length)
+            : text
+        this.toolExecutionOutputs.set(toolCallId, text)
         const content = visibleText
           ? ([{ type: 'content', content: { type: 'text', text: visibleText } }] satisfies ToolCallContent[])
           : undefined
@@ -980,11 +1024,39 @@ export class PiAcpSession {
       }
 
       case 'agent_settled': {
+        // The required Pi RPC contract makes agent_settled terminal after automatic
+        // retry/compaction/queued continuation. Rely on that ordering: settle this turn
+        // atomically, flush notifications, then resolve it and start the next.
+        if (this.cancelledPendingTurn) {
+          this.cancelledPendingTurn = false
+          const cancelled = this.pendingTurn
+          this.pendingTurn = null
+          this.clearPendingUsage()
+          this.resetSubagentTracking()
+          this.inAgentLoop = false
+          void this.flushEmits().finally(() => {
+            cancelled?.resolve('cancelled')
+            const next = this.turnQueue.shift()
+            if (next) {
+              this.emit({
+                sessionUpdate: 'session_info_update',
+                _meta: { piAcp: { queueDepth: this.turnQueue.length, running: true } }
+              })
+              this.startTurn(next)
+            } else {
+              this.emit({
+                sessionUpdate: 'session_info_update',
+                _meta: { piAcp: { queueDepth: 0, running: false } }
+              })
+            }
+          })
+          return
+        }
         // Emit at most one usage_update per prompt, from the latest buffered top-level
         // turn_end, right before the ACP `session/prompt` request resolves.
         const usageEvent = this.pendingUsageEvent
         this.pendingUsageEvent = null
-        const usagePromise = usageEvent ? this.emitUsageUpdate(usageEvent) : Promise.resolve()
+        const usagePromise = usageEvent ? this.emitUsageUpdate() : Promise.resolve()
 
         // Ensure all updates derived from pi events are delivered before we resolve
         // the ACP `session/prompt` request.
