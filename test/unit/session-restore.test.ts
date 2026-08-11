@@ -177,7 +177,7 @@ test('PiAcpAgent: setSessionConfigOption auto-restores via pi session discovery 
       }
     ])
     assert.deepEqual(setModelCalls, [{ provider: 'test', modelId: 'beta' }])
-    assert.equal(result.configOptions.find(option => option.id === 'model')?.currentValue, 'test/beta')
+    assert.equal(result.configOptions.find(option => option.id === 'model')?.currentValue, 'beta')
     assert.deepEqual(storeUpserts, [
       {
         sessionId: 'fallback-session',

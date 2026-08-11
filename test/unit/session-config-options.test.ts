@@ -23,7 +23,7 @@ class FakeSessions {
   }
 }
 
-test('PiAcpAgent: newSession returns configOptions for model and thinking selectors', async () => {
+test('PiAcpAgent: newSession returns configOptions for provider, model, and thinking selectors', async () => {
   const realSetTimeout = globalThis.setTimeout
   ;(globalThis as any).setTimeout = () => 0 as any
 
@@ -62,14 +62,23 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
     assert.deepEqual(result.configOptions, [
       {
         type: 'select',
+        id: 'provider',
+        category: 'model',
+        name: 'Provider',
+        description: 'Select the provider for this session',
+        currentValue: 'test',
+        options: [{ value: 'test', name: 'test', description: null }]
+      },
+      {
+        type: 'select',
         id: 'model',
         category: 'model',
         name: 'Model',
         description: 'Select the model for this session',
-        currentValue: 'test/beta',
+        currentValue: 'beta',
         options: [
-          { value: 'test/alpha', name: 'test/Alpha', description: null },
-          { value: 'test/beta', name: 'test/Beta', description: null }
+          { value: 'alpha', name: 'test/Alpha', description: null },
+          { value: 'beta', name: 'test/Beta', description: null }
         ]
       },
       {
@@ -130,11 +139,11 @@ test('PiAcpAgent: setSessionConfigOption maps model changes to pi and emits conf
   const result = await agent.setSessionConfigOption({
     sessionId: 's1',
     configId: 'model',
-    value: 'test/beta'
+    value: 'beta'
   } as any)
 
   assert.deepEqual(setModelCalls, [{ provider: 'test', modelId: 'beta' }])
-  assert.equal(result.configOptions.find(option => option.id === 'model')?.currentValue, 'test/beta')
+  assert.equal(result.configOptions.find(option => option.id === 'model')?.currentValue, 'beta')
   assert.deepEqual(conn.updates, [
     {
       sessionId: 's1',
@@ -144,6 +153,48 @@ test('PiAcpAgent: setSessionConfigOption maps model changes to pi and emits conf
       }
     }
   ])
+})
+
+test('PiAcpAgent: provider selection uses a model from that provider and filters model choices', async () => {
+  const conn = new FakeAgentSideConnection()
+  const state = { model: { provider: 'one', id: 'a' }, thinkingLevel: 'medium' }
+  const calls: Array<{ provider: string; modelId: string }> = []
+  const session = {
+    sessionId: 's1',
+    cwd: process.cwd(),
+    proc: {
+      async getAvailableModels() {
+        return {
+          models: [
+            { provider: 'one', id: 'a', name: 'A' },
+            { provider: 'two', id: 'b', name: 'B' },
+            { provider: 'two', id: 'c', name: 'C' }
+          ]
+        }
+      },
+      async getState() {
+        return state
+      },
+      async setModel(provider: string, modelId: string) {
+        calls.push({ provider, modelId })
+        state.model = { provider, id: modelId }
+      }
+    }
+  }
+  const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+  ;(agent as any).sessions = new FakeSessions(session) as any
+
+  const result = await agent.setSessionConfigOption({ sessionId: 's1', configId: 'provider', value: 'two' } as any)
+
+  assert.deepEqual(calls, [{ provider: 'two', modelId: 'b' }])
+  const modelOption = result.configOptions.find(option => option.id === 'model')
+  assert.equal(modelOption?.type, 'select')
+  if (modelOption?.type === 'select') {
+    assert.deepEqual(modelOption.options, [
+      { value: 'b', name: 'two/B', description: null },
+      { value: 'c', name: 'two/C', description: null }
+    ])
+  }
 })
 
 test('PiAcpAgent: setSessionConfigOption maps thought level changes to pi and emits sync updates', async () => {

@@ -58,6 +58,7 @@ type AdvertisedModel = {
   description?: string | null
 }
 
+const PROVIDER_CONFIG_ID = 'provider'
 const MODEL_CONFIG_ID = 'model'
 const THOUGHT_LEVEL_CONFIG_ID = 'thought_level'
 
@@ -1172,7 +1173,9 @@ export class PiAcpAgent implements ACPAgent {
       throw RequestError.invalidParams(`Expected string value for config option: ${configId}`)
     }
 
-    if (configId === MODEL_CONFIG_ID) {
+    if (configId === PROVIDER_CONFIG_ID) {
+      await setSessionProvider(session.proc, params.value)
+    } else if (configId === MODEL_CONFIG_ID) {
       await setSessionModel(session.proc, params.value)
     } else if (configId === THOUGHT_LEVEL_CONFIG_ID) {
       if (!isThinkingLevel(params.value)) {
@@ -1298,19 +1301,34 @@ function buildConfigOptions(state: {
   ]
 
   if (state.models?.availableModels.length) {
-    configOptions.unshift({
-      type: 'select',
-      id: MODEL_CONFIG_ID,
-      category: 'model',
-      name: 'Model',
-      description: 'Select the model for this session',
-      currentValue: state.models.currentModelId,
-      options: state.models.availableModels.map(model => ({
-        value: model.modelId,
-        name: model.name,
-        description: model.description ?? null
-      }))
-    })
+    const providers = [...new Set(state.models.availableModels.map(model => model.modelId.split('/')[0]))]
+    const provider = state.models.currentModelId.split('/')[0]
+    configOptions.unshift(
+      {
+        type: 'select',
+        id: PROVIDER_CONFIG_ID,
+        category: 'model',
+        name: 'Provider',
+        description: 'Select the provider for this session',
+        currentValue: provider,
+        options: providers.map(value => ({ value, name: value, description: null }))
+      },
+      {
+        type: 'select',
+        id: MODEL_CONFIG_ID,
+        category: 'model',
+        name: 'Model',
+        description: 'Select the model for this session',
+        currentValue: state.models.currentModelId.split('/').slice(1).join('/'),
+        options: state.models.availableModels
+          .filter(model => model.modelId.startsWith(`${provider}/`))
+          .map(model => ({
+            value: model.modelId.split('/').slice(1).join('/'),
+            name: model.name,
+            description: model.description ?? null
+          }))
+      }
+    )
   }
 
   return configOptions
@@ -1401,12 +1419,29 @@ async function emitConfigOptionsUpdate(
   return configOptions
 }
 
+async function setSessionProvider(proc: PiRpcProcess, provider: string): Promise<void> {
+  const data: unknown = await proc.getAvailableModels()
+  const models: unknown[] =
+    typeof data === 'object' && data !== null && 'models' in data && Array.isArray(data.models) ? data.models : []
+  const found = models.find(model => {
+    if (typeof model !== 'object' || model === null || !('provider' in model)) return false
+    return String(model.provider) === provider
+  })
+  if (!found || typeof found !== 'object' || found === null || !('id' in found)) {
+    throw RequestError.invalidParams(`Unknown provider: ${provider}`)
+  }
+  await proc.setModel(provider, String(found.id))
+}
+
 async function setSessionModel(proc: PiRpcProcess, requestedModelId: string): Promise<void> {
   // Accept either:
   //  - "provider/model" (preferred, matches how we advertise)
   //  - "model" (fallback, resolve via available models)
   let provider: string | null = null
   let modelId: string | null = null
+
+  const state = (await proc.getState()) as any
+  const currentProvider = String(state?.model?.provider ?? '').trim()
 
   if (requestedModelId.includes('/')) {
     const [candidateProvider, ...rest] = requestedModelId.split('/')
@@ -1416,6 +1451,7 @@ async function setSessionModel(proc: PiRpcProcess, requestedModelId: string): Pr
     modelId = requestedModelId
   }
 
+  if (!provider && currentProvider) provider = currentProvider
   if (!provider) {
     const data = (await proc.getAvailableModels()) as any
     const models: any[] = Array.isArray(data?.models) ? data.models : []
