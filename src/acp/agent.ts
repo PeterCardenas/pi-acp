@@ -126,6 +126,7 @@ export class PiAcpAgent implements ACPAgent {
   private readonly sessions = new SessionManager()
   private readonly store = new SessionStore()
   private readonly restoringSessions = new Map<string, Promise<PiAcpSession>>()
+  private readonly sessionConfigQueues = new Map<string, Promise<void>>()
 
   dispose(): void {
     this.sessions.disposeAll()
@@ -137,6 +138,23 @@ export class PiAcpAgent implements ACPAgent {
   constructor(conn: AgentSideConnection, _config?: unknown) {
     this.conn = conn
     void _config
+  }
+
+  private async withSessionConfigQueue<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.sessionConfigQueues.get(sessionId) ?? Promise.resolve()
+    let release!: () => void
+    const current = new Promise<void>(resolve => {
+      release = resolve
+    })
+    this.sessionConfigQueues.set(sessionId, current)
+
+    await previous
+    try {
+      return await operation()
+    } finally {
+      release()
+      if (this.sessionConfigQueues.get(sessionId) === current) this.sessionConfigQueues.delete(sessionId)
+    }
   }
 
   private cleanupFailedNewSession(sessionId: string, state?: any | null): void {
@@ -1137,32 +1155,36 @@ export class PiAcpAgent implements ACPAgent {
 
   async unstable_setSessionModel(params: { sessionId: string; modelId: string }): Promise<void> {
     const session = await this.restoreSession(params.sessionId)
-    await setSessionModel(session.proc, params.modelId)
-    await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
+    await this.withSessionConfigQueue(session.sessionId, async () => {
+      await setSessionModel(session.proc, params.modelId)
+      await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
+    })
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
     const session = await this.restoreSession(params.sessionId)
 
-    const mode = String(params.modeId)
-    if (!isThinkingLevel(mode)) {
-      throw RequestError.invalidParams(`Unknown modeId: ${mode}`)
-    }
-
-    await session.proc.setThinkingLevel(mode)
-
-    // Let the client know the current mode changed (keeps the dropdown in sync).
-    void this.conn.sessionUpdate({
-      sessionId: session.sessionId,
-      update: {
-        sessionUpdate: 'current_mode_update',
-        currentModeId: mode
+    return this.withSessionConfigQueue(session.sessionId, async () => {
+      const mode = String(params.modeId)
+      if (!isThinkingLevel(mode)) {
+        throw RequestError.invalidParams(`Unknown modeId: ${mode}`)
       }
+
+      await session.proc.setThinkingLevel(mode)
+
+      // Let the client know the current mode changed (keeps the dropdown in sync).
+      await this.conn.sessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'current_mode_update',
+          currentModeId: mode
+        }
+      })
+
+      await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
+
+      return {}
     })
-
-    await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
-
-    return {}
   }
 
   async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
@@ -1173,30 +1195,32 @@ export class PiAcpAgent implements ACPAgent {
       throw RequestError.invalidParams(`Expected string value for config option: ${configId}`)
     }
 
-    if (configId === PROVIDER_CONFIG_ID) {
-      await setSessionProvider(session.proc, params.value)
-    } else if (configId === MODEL_CONFIG_ID) {
-      await setSessionModel(session.proc, params.value)
-    } else if (configId === THOUGHT_LEVEL_CONFIG_ID) {
-      if (!isThinkingLevel(params.value)) {
-        throw RequestError.invalidParams(`Unknown thinking level: ${params.value}`)
+    return this.withSessionConfigQueue(session.sessionId, async () => {
+      if (configId === PROVIDER_CONFIG_ID) {
+        await setSessionProvider(session.proc, params.value)
+      } else if (configId === MODEL_CONFIG_ID) {
+        await setSessionConfigModel(session.proc, params.value)
+      } else if (configId === THOUGHT_LEVEL_CONFIG_ID) {
+        if (!isThinkingLevel(params.value)) {
+          throw RequestError.invalidParams(`Unknown thinking level: ${params.value}`)
+        }
+
+        await session.proc.setThinkingLevel(params.value)
+
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'current_mode_update',
+            currentModeId: params.value
+          }
+        })
+      } else {
+        throw RequestError.invalidParams(`Unknown config option: ${configId}`)
       }
 
-      await session.proc.setThinkingLevel(params.value)
-
-      void this.conn.sessionUpdate({
-        sessionId: session.sessionId,
-        update: {
-          sessionUpdate: 'current_mode_update',
-          currentModeId: params.value
-        }
-      })
-    } else {
-      throw RequestError.invalidParams(`Unknown config option: ${configId}`)
-    }
-
-    const configOptions = await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
-    return { configOptions }
+      const configOptions = await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
+      return { configOptions }
+    })
   }
 }
 
@@ -1433,30 +1457,72 @@ async function setSessionProvider(proc: PiRpcProcess, provider: string): Promise
   await proc.setModel(provider, String(found.id))
 }
 
+async function setSessionConfigModel(proc: PiRpcProcess, requestedModelId: string): Promise<void> {
+  const state: unknown = await proc.getState()
+  const model =
+    typeof state === 'object' &&
+    state !== null &&
+    'model' in state &&
+    typeof state.model === 'object' &&
+    state.model !== null
+      ? state.model
+      : null
+  const provider = model !== null && 'provider' in model ? String(model.provider).trim() : ''
+  const data: unknown = await proc.getAvailableModels()
+  const models: unknown[] =
+    typeof data === 'object' && data !== null && 'models' in data && Array.isArray(data.models) ? data.models : []
+  const found = models.find(model => {
+    if (typeof model !== 'object' || model === null || !('provider' in model) || !('id' in model)) return false
+    return String(model.provider) === provider && String(model.id) === requestedModelId
+  })
+
+  // Config option values are provider-stripped, so only advertised models for the current provider are valid.
+  if (!provider || !found) {
+    throw RequestError.invalidParams(`Unknown modelId: ${requestedModelId}`)
+  }
+
+  await proc.setModel(provider, requestedModelId)
+}
+
 async function setSessionModel(proc: PiRpcProcess, requestedModelId: string): Promise<void> {
   // Accept either:
   //  - "provider/model" (preferred, matches how we advertise)
   //  - "model" (fallback, resolve via available models)
   let provider: string | null = null
   let modelId: string | null = null
+  const isBareModel = !requestedModelId.includes('/')
 
   const state = (await proc.getState()) as any
   const currentProvider = String(state?.model?.provider ?? '').trim()
+  let models: unknown[] = []
 
-  if (requestedModelId.includes('/')) {
+  if (!isBareModel) {
     const [candidateProvider, ...rest] = requestedModelId.split('/')
     provider = candidateProvider
     modelId = rest.join('/')
   } else {
+    const data: unknown = await proc.getAvailableModels()
+    models =
+      typeof data === 'object' && data !== null && 'models' in data && Array.isArray(data.models) ? data.models : []
     modelId = requestedModelId
+    if (currentProvider) {
+      provider = currentProvider
+      const found = models.find(model => {
+        if (typeof model !== 'object' || model === null || !('provider' in model) || !('id' in model)) return false
+        return String(model.provider) === provider && String(model.id) === modelId
+      })
+      if (!found) {
+        throw RequestError.invalidParams(`Unknown modelId: ${requestedModelId}`)
+      }
+    }
   }
 
-  if (!provider && currentProvider) provider = currentProvider
   if (!provider) {
-    const data = (await proc.getAvailableModels()) as any
-    const models: any[] = Array.isArray(data?.models) ? data.models : []
-    const found = models.find(m => String(m?.id) === modelId)
-    if (found) {
+    const found = models.find(model => {
+      if (typeof model !== 'object' || model === null || !('id' in model)) return false
+      return String(model.id) === modelId
+    })
+    if (found && typeof found === 'object' && found !== null && 'provider' in found && 'id' in found) {
       provider = String(found.provider)
       modelId = String(found.id)
     }

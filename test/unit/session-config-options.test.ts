@@ -155,6 +155,211 @@ test('PiAcpAgent: setSessionConfigOption maps model changes to pi and emits conf
   ])
 })
 
+test('PiAcpAgent: config model selection preserves slash-containing model IDs for the current provider', async () => {
+  const conn = new FakeAgentSideConnection()
+  const state = {
+    thinkingLevel: 'medium',
+    model: { provider: 'openrouter', id: 'anthropic/claude-sonnet' }
+  }
+  const setModelCalls: Array<{ provider: string; modelId: string }> = []
+
+  const session = {
+    sessionId: 's1',
+    cwd: process.cwd(),
+    proc: {
+      async getAvailableModels() {
+        return {
+          models: [
+            { provider: 'openrouter', id: 'anthropic/claude-sonnet', name: 'Claude Sonnet' },
+            { provider: 'other', id: 'anthropic/claude-sonnet', name: 'Other Claude Sonnet' }
+          ]
+        }
+      },
+      async getState() {
+        return state
+      },
+      async setModel(provider: string, modelId: string) {
+        setModelCalls.push({ provider, modelId })
+        state.model = { provider, id: modelId }
+      }
+    }
+  }
+  const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+  ;(agent as any).sessions = new FakeSessions(session) as any
+
+  await agent.setSessionConfigOption({
+    sessionId: 's1',
+    configId: 'model',
+    value: 'anthropic/claude-sonnet'
+  } as any)
+
+  assert.deepEqual(setModelCalls, [{ provider: 'openrouter', modelId: 'anthropic/claude-sonnet' }])
+})
+
+test('PiAcpAgent: rapid provider then model requests apply the requested model after the provider switch', async () => {
+  const conn = new FakeAgentSideConnection()
+  const state = { model: { provider: 'one', id: 'a' }, thinkingLevel: 'medium' }
+  const calls: Array<{ provider: string; modelId: string }> = []
+  let providerSetModelStarted!: () => void
+  let releaseProviderSetModel!: () => void
+  const providerSetModelStartedPromise = new Promise<void>(resolve => {
+    providerSetModelStarted = resolve
+  })
+  const providerSetModelReleasePromise = new Promise<void>(resolve => {
+    releaseProviderSetModel = resolve
+  })
+
+  const session = {
+    sessionId: 's1',
+    cwd: process.cwd(),
+    proc: {
+      async getAvailableModels() {
+        return {
+          models: [
+            { provider: 'one', id: 'a', name: 'A' },
+            { provider: 'two', id: 'b', name: 'B' },
+            { provider: 'two', id: 'c', name: 'C' }
+          ]
+        }
+      },
+      async getState() {
+        return { ...state, model: { ...state.model } }
+      },
+      async setModel(provider: string, modelId: string) {
+        calls.push({ provider, modelId })
+        if (provider === 'two' && modelId === 'b') {
+          providerSetModelStarted()
+          await providerSetModelReleasePromise
+        }
+        state.model = { provider, id: modelId }
+      }
+    }
+  }
+  const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+  ;(agent as any).sessions = new FakeSessions(session) as any
+
+  const providerRequest = agent.setSessionConfigOption({
+    sessionId: 's1',
+    configId: 'provider',
+    value: 'two'
+  } as any)
+  await providerSetModelStartedPromise
+
+  const modelRequest = agent.setSessionConfigOption({
+    sessionId: 's1',
+    configId: 'model',
+    value: 'c'
+  } as any)
+
+  releaseProviderSetModel()
+  await Promise.all([providerRequest, modelRequest])
+
+  assert.deepEqual(calls, [
+    { provider: 'two', modelId: 'b' },
+    { provider: 'two', modelId: 'c' }
+  ])
+  assert.deepEqual(state.model, { provider: 'two', id: 'c' })
+  assert.deepEqual(
+    conn.updates.map(update => {
+      const options = update.update.sessionUpdate === 'config_option_update' ? update.update.configOptions : []
+      return options.find(option => option.id === 'model')?.currentValue
+    }),
+    ['b', 'c']
+  )
+})
+
+test('PiAcpAgent: rapid thought-level updates await ordered mode notifications without unhandled rejection', async () => {
+  const conn = new FakeAgentSideConnection()
+  const state = {
+    thinkingLevel: 'medium',
+    model: { provider: 'test', id: 'alpha' }
+  }
+  const modeNotifications: string[] = []
+  const unhandledRejections: unknown[] = []
+  let firstNotificationStarted!: () => void
+  let releaseFirstNotification!: () => void
+  const firstNotificationStartedPromise = new Promise<void>(resolve => {
+    firstNotificationStarted = resolve
+  })
+  const firstNotificationPromise = new Promise<void>(resolve => {
+    releaseFirstNotification = resolve
+  })
+  const onUnhandledRejection = (reason: unknown) => {
+    unhandledRejections.push(reason)
+  }
+  const originalSessionUpdate = conn.sessionUpdate.bind(conn)
+  conn.sessionUpdate = async msg => {
+    if (msg.update.sessionUpdate === 'current_mode_update') {
+      modeNotifications.push(msg.update.currentModeId)
+      if (modeNotifications.length === 1) {
+        firstNotificationStarted()
+        await firstNotificationPromise
+      }
+      if (msg.update.currentModeId === 'high') {
+        throw new Error('current mode notification failed')
+      }
+    }
+    await originalSessionUpdate(msg)
+  }
+
+  const session = {
+    sessionId: 's1',
+    cwd: process.cwd(),
+    proc: {
+      async getAvailableModels() {
+        return { models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }
+      },
+      async getState() {
+        return state
+      },
+      async setThinkingLevel(level: string) {
+        state.thinkingLevel = level
+      }
+    }
+  }
+  const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+  ;(agent as any).sessions = new FakeSessions(session) as any
+
+  let firstRequest: Promise<unknown> | undefined
+  let secondRequest: Promise<unknown> | undefined
+  process.on('unhandledRejection', onUnhandledRejection)
+  try {
+    firstRequest = agent.setSessionConfigOption({
+      sessionId: 's1',
+      configId: 'thought_level',
+      value: 'low'
+    } as any)
+    await firstNotificationStartedPromise
+
+    secondRequest = agent.setSessionConfigOption({
+      sessionId: 's1',
+      configId: 'thought_level',
+      value: 'high'
+    } as any)
+    await new Promise<void>(resolve => setImmediate(resolve))
+
+    assert.deepEqual(modeNotifications, ['low'])
+    assert.equal(conn.updates.length, 0)
+
+    releaseFirstNotification()
+    await firstRequest
+    await assert.rejects(secondRequest, /current mode notification failed/)
+    await new Promise<void>(resolve => setImmediate(resolve))
+
+    assert.deepEqual(modeNotifications, ['low', 'high'])
+    assert.deepEqual(
+      conn.updates.map(update => update.update.sessionUpdate),
+      ['current_mode_update', 'config_option_update']
+    )
+    assert.deepEqual(unhandledRejections, [])
+  } finally {
+    releaseFirstNotification()
+    await firstRequest?.catch(() => undefined)
+    await secondRequest?.catch(() => undefined)
+    process.off('unhandledRejection', onUnhandledRejection)
+  }
+})
+
 test('PiAcpAgent: provider selection uses a model from that provider and filters model choices', async () => {
   const conn = new FakeAgentSideConnection()
   const state = { model: { provider: 'one', id: 'a' }, thinkingLevel: 'medium' }

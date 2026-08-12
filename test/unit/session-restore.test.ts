@@ -166,7 +166,7 @@ test('PiAcpAgent: setSessionConfigOption auto-restores via pi session discovery 
     const result = await agent.setSessionConfigOption({
       sessionId: 'fallback-session',
       configId: 'model',
-      value: 'test/beta'
+      value: 'beta'
     } as any)
 
     assert.deepEqual(spawnCalls, [
