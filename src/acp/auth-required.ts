@@ -2,30 +2,19 @@ import { RequestError } from '@agentclientprotocol/sdk'
 import { getAuthMethods } from './auth.js'
 
 /**
- * Best-effort detection of missing credentials / not-configured errors from pi/providers.
+ * Best-effort detection of authentication errors from pi/providers.
  *
- * We can't do a full provider-specific check here, so we look for common substrings.
+ * We can't do a full provider-specific check here, so we look for bounded, explicit evidence.
  */
 export function maybeAuthRequiredError(err: unknown): RequestError | null {
-  const msg = String((err as any)?.message ?? err ?? '')
+  const msg = String((err as { message?: unknown })?.message ?? err ?? '')
   const s = msg.toLowerCase()
+  const authEvidence =
+    /\b(?:missing|no|invalid|expired|rejected|required|not\s+configured)\s+(?:api[\s_-]?key|apikey|key)\b|\b(?:api[\s_-]?key|apikey)\s+(?:is\s+)?(?:missing|invalid|expired|rejected|required|not\s+configured)\b|\bunauthorized\b|\bauthentication\s+(?:required|failed|error)\b|\b(?:http(?:\s+status)?|status|error|request\s+failed\s+with)\s*[:=]?\s*401\b/.test(
+      s
+    )
 
-  const patterns = [
-    'api key',
-    'apikey',
-    'missing key',
-    'no key',
-    'not configured',
-    'unauthorized',
-    'authentication',
-    'permission denied',
-    'forbidden',
-    '401',
-    '403'
-  ]
-
-  const hit = patterns.some(p => s.includes(p))
-  if (!hit) return null
+  if (!authEvidence) return null
 
   // Include terminal auth method options in error data.
   return RequestError.authRequired(

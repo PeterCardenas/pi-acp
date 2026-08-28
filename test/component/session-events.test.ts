@@ -317,6 +317,145 @@ test('PiAcpSession: suppresses usage_update from turn_end while a subagent tool 
   })
 })
 
+test('PiAcpSession: rejects active and queued prompts when pi reports a runtime authentication error', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: asPiRpcProcess(proc),
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const active = session.prompt('hello')
+  const queued = session.prompt('queued')
+  assert.equal(proc.prompts.length, 1)
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'error',
+      reason: 'error',
+      error: { stopReason: 'error', errorMessage: 'No API key for provider: openai' }
+    }
+  })
+  proc.emit({ type: 'agent_settled' })
+
+  for (const prompt of [active, queued]) {
+    const settled = Promise.race([
+      prompt,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('prompt settlement timeout')), 100))
+    ])
+    await assert.rejects(
+      settled,
+      (error: unknown) => typeof error === 'object' && error !== null && 'code' in error && error.code === -32000
+    )
+  }
+  assert.equal(proc.prompts.length, 1)
+})
+
+test('PiAcpSession: rejects the prompt with AUTH_REQUIRED when pi reports an authentication error', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: asPiRpcProcess(proc),
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const prompt = session.prompt('hello')
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'error',
+      reason: 'error',
+      error: { stopReason: 'error', errorMessage: 'No API key for provider: openai' }
+    }
+  })
+  proc.emit({ type: 'agent_settled' })
+
+  await assert.rejects(
+    prompt,
+    (error: unknown) =>
+      typeof error === 'object' &&
+      error !== null &&
+      'code' in error &&
+      error.code === -32000 &&
+      'message' in error &&
+      String(error.message).includes('Authentication required')
+  )
+})
+
+test('PiAcpSession: does not retain a retry authentication error after a successful response', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: asPiRpcProcess(proc),
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const prompt = session.prompt('hello')
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'error',
+      reason: 'error',
+      error: { stopReason: 'error', errorMessage: 'Unauthorized' }
+    }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'done', reason: 'stop', message: { stopReason: 'stop' } }
+  })
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await prompt, 'end_turn')
+})
+
+test('PiAcpSession: rejects queued prompts with AUTH_REQUIRED when proc.prompt rejects', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  let promptCount = 0
+  proc.prompt = async () => {
+    promptCount += 1
+    throw new Error('invalid API key')
+  }
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: asPiRpcProcess(proc),
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const active = session.prompt('active')
+  const queued = session.prompt('queued')
+  const [activeError, queuedError] = await Promise.all([
+    active.then(
+      () => null,
+      error => error
+    ),
+    queued.then(
+      () => null,
+      error => error
+    )
+  ])
+
+  assert.equal(activeError?.code, -32000)
+  assert.equal(queuedError?.code, -32000)
+  assert.equal(promptCount, 1)
+})
+
 test('PiAcpSession: clears buffered usage on prompt failure and does not leak into next turn', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()

@@ -292,6 +292,7 @@ export class PiAcpSession {
   // Buffered usage from the most recent top-level `turn_end` for the current prompt.
   // Only one `usage_update` is emitted per prompt, right before it settles.
   private pendingUsageEvent: PiRpcEvent | null = null
+  private pendingAuthError: RequestError | null = null
 
   // pi can emit multiple `turn_end` and `agent_end` events for a single user prompt
   // when retry, compaction, or queued continuations run. The session-level prompt
@@ -595,6 +596,7 @@ export class PiAcpSession {
     this.cancelRequested = false
     this.inAgentLoop = false
     this.clearPendingUsage()
+    this.pendingAuthError = null
     this.resetSubagentTracking()
 
     this.pendingTurn = { resolve: t.resolve, reject: t.reject }
@@ -619,11 +621,12 @@ export class PiAcpSession {
         this.pendingTurn = null
         if (authErr) current?.reject(authErr)
         else current?.resolve(this.cancelRequested ? 'cancelled' : 'error')
-        for (const queued of this.turnQueue.splice(0)) queued.reject(err)
+        for (const queued of this.turnQueue.splice(0)) queued.reject(authErr ?? err)
         this.cancelledPendingTurn = false
         this.cancelRequested = false
         this.inAgentLoop = false
         this.clearPendingUsage()
+        this.pendingAuthError = null
         this.resetSubagentTracking()
 
         // If the prompt failed, do not automatically proceed—pi may be unhealthy.
@@ -747,6 +750,12 @@ export class PiAcpSession {
           }
 
           break
+        }
+
+        if (ame?.type === 'error' && ame.reason === 'error') {
+          this.pendingAuthError = maybeAuthRequiredError(ame.error?.errorMessage)
+        } else if (ame?.type === 'done') {
+          this.pendingAuthError = null
         }
 
         // Ignore other delta/event types for now.
@@ -1024,6 +1033,7 @@ export class PiAcpSession {
           const cancelled = this.pendingTurn
           this.pendingTurn = null
           this.clearPendingUsage()
+          this.pendingAuthError = null
           this.resetSubagentTracking()
           this.inAgentLoop = false
           void this.flushEmits().finally(() => {
@@ -1047,8 +1057,10 @@ export class PiAcpSession {
         // Emit at most one usage_update per prompt, from the latest buffered top-level
         // turn_end, right before the ACP `session/prompt` request resolves.
         const usageEvent = this.pendingUsageEvent
+        const authError = this.pendingAuthError
         this.pendingUsageEvent = null
-        const usagePromise = usageEvent ? this.emitUsageUpdate() : Promise.resolve()
+        this.pendingAuthError = null
+        const usagePromise = usageEvent && !authError ? this.emitUsageUpdate() : Promise.resolve()
 
         // Ensure all updates derived from pi events are delivered before we resolve
         // the ACP `session/prompt` request.
@@ -1056,12 +1068,17 @@ export class PiAcpSession {
           .then(() => this.flushEmits())
           .finally(() => {
             const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
-            this.pendingTurn?.resolve(reason)
+            if (authError) {
+              this.pendingTurn?.reject(authError)
+              for (const queued of this.turnQueue.splice(0)) queued.reject(authError)
+            } else {
+              this.pendingTurn?.resolve(reason)
+            }
             this.pendingTurn = null
             this.inAgentLoop = false
 
-            // Start next queued prompt, if any.
-            const next = this.turnQueue.shift()
+            // Authentication failures invalidate queued work; never start another Pi prompt.
+            const next = authError ? null : this.turnQueue.shift()
             if (next) {
               this.emit({
                 sessionUpdate: 'agent_message_chunk',

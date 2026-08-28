@@ -334,7 +334,13 @@ export class PiAcpAgent implements ACPAgent {
         })
     ])
 
+    const stateAuthErr = maybeAuthRequiredError(stateErr)
     const availableModelsAuthErr = maybeAuthRequiredError(availableModelsErr)
+
+    if (stateAuthErr) {
+      this.cleanupFailedNewSession(session.sessionId, state)
+      throw stateAuthErr
+    }
 
     if (availableModelsAuthErr) {
       this.cleanupFailedNewSession(session.sessionId, state)
@@ -346,23 +352,12 @@ export class PiAcpAgent implements ACPAgent {
       throw RequestError.internalError({}, String((availableModelsErr as Error)?.message ?? availableModelsErr))
     }
 
-    // If pi has no models available after spawning, it's effectively unauthenticated.
+    // An empty successful model list is a configuration problem, not authentication evidence.
     const rawModelsCount = Array.isArray(availableModels?.models) ? availableModels.models.length : 0
 
     if (rawModelsCount === 0) {
       this.cleanupFailedNewSession(session.sessionId, state)
-      throw RequestError.authRequired(
-        { authMethods: getAuthMethods() },
-        'Configure an API key or log in with an OAuth provider.'
-      )
-    }
-
-    if (stateErr && maybeAuthRequiredError(stateErr)) {
-      this.cleanupFailedNewSession(session.sessionId, state)
-      throw RequestError.authRequired(
-        { authMethods: getAuthMethods() },
-        'Configure an API key or log in with an OAuth provider.'
-      )
+      throw RequestError.internalError({}, 'No models configured')
     }
 
     const { configOptions, models, modes } = await getSessionConfiguration(session.proc, {
