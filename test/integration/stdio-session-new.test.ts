@@ -1,12 +1,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 
-type JsonRpcResponse = { id: number; result?: { sessionId?: string }; error?: { code: number; message: string } }
+type JsonRpcResponse = {
+  id: number
+  result?: { sessionId?: string }
+  error?: { code: number; message: string; data?: { authMethods?: unknown[] } }
+}
 type Scenario = 'empty' | 'auth' | 'mixed' | 'runtime'
 const REQUEST_TIMEOUT_MS = 10_000
 const EXIT_TIMEOUT_MS = 1000
@@ -18,8 +22,11 @@ function entrypoint(explicitPath?: string): { command: string; args: string[] } 
   return { command: entry, args: [] }
 }
 
+type SpawnACPOptions = { env?: NodeJS.ProcessEnv; authArgvRecordFile?: string }
+
 async function runScenario(
   mode: Scenario,
+  options: SpawnACPOptions = {},
   action: (request: Request) => Promise<void> = async request => {
     const response = await request.call('session/new', { cwd: request.cwd, mcpServers: [] })
     assert.ok(response.error)
@@ -32,7 +39,12 @@ async function runScenario(
   const target = entrypoint()
   const child = spawn(target.command, target.args, {
     cwd: process.cwd(),
-    env: { ...process.env, PI_ACP_PI_COMMAND: fake },
+    env: {
+      ...process.env,
+      ...options.env,
+      ...(options.authArgvRecordFile ? { PI_ACP_AUTH_ARGV_RECORD_FILE: options.authArgvRecordFile } : {}),
+      PI_ACP_PI_COMMAND: fake
+    },
     stdio: ['pipe', 'pipe', 'pipe']
   })
   const stderr: string[] = []
@@ -117,6 +129,16 @@ import readline from 'node:readline';
 const mode = ${JSON.stringify(mode)};
 const models = [{provider:'openai', id:'gpt-test', name:'GPT Test'}];
 const out = value => process.stdout.write(JSON.stringify(value) + '\\n');
+if (process.argv.includes('auth')) {
+  const expected = ['auth', 'check', '--provider', 'openai', '--json'];
+  if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(expected)) process.exit(2);
+  if (process.env.PI_ACP_AUTH_ARGV_RECORD_FILE) {
+    const fs = await import('node:fs/promises');
+    await fs.writeFile(process.env.PI_ACP_AUTH_ARGV_RECORD_FILE, process.argv.slice(2).join(' '));
+  }
+  if (process.env.PI_ACP_AUTH_MODE === 'not_ready') { out({provider:'openai',status:'not_ready',reason:'credentials_not_configured'}); process.exit(1); }
+  out({provider:'openai',status:'ready',code:0}); process.exit(0);
+}
 readline.createInterface({input:process.stdin}).on('line', line => {
   const r = JSON.parse(line);
   if (r.type === 'get_state') out({type:'response',id:r.id,command:r.type,success:mode==='mixed'?false:true,error:mode==='mixed'?'Authentication required':undefined,data:{thinkingLevel:'medium',model:mode==='runtime'?{provider:'openai',id:'gpt-test',name:'GPT Test'}:null}});
@@ -154,23 +176,45 @@ test('entrypoint dispatches by explicit file extension', () => {
 })
 
 test('session/new reports zero models as an internal error', async () => {
-  await runScenario('empty', async request => {
+  await runScenario('empty', {}, async request => {
     const response = await request.call('session/new', { cwd: request.cwd, mcpServers: [] })
     assert.equal(response.error?.code, -32603)
     assert.match(response.error?.message ?? '', /No models configured/)
   })
 })
 
+test('session/new reports child auth failures with auth methods and exact argv', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-acp-auth-'))
+  const recordFile = join(dir, 'auth-argv.txt')
+  try {
+    await runScenario(
+      'runtime',
+      {
+        env: { PI_ACP_AUTH_MODE: 'not_ready' },
+        authArgvRecordFile: recordFile
+      },
+      async request => {
+        const response = await request.call('session/new', { cwd: request.cwd, mcpServers: [] })
+        assert.equal(response.error?.code, -32000)
+        assert.ok(response.error?.data?.authMethods?.length)
+        assert.equal((await readFile(recordFile, 'utf8')).trim(), 'auth check --provider openai --json')
+      }
+    )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('session/new reports startup authentication failures on the wire', async () => {
   for (const mode of ['mixed', 'auth'] as const)
-    await runScenario(mode, async request => {
+    await runScenario(mode, {}, async request => {
       const response = await request.call('session/new', { cwd: request.cwd, mcpServers: [] })
       assert.equal(response.error?.code, -32000)
     })
 })
 
 test('session/prompt reports runtime authentication failures on the wire', async () => {
-  await runScenario('runtime', async request => {
+  await runScenario('runtime', {}, async request => {
     const created = await request.call('session/new', { cwd: request.cwd, mcpServers: [] })
     assert.ok(created.result?.sessionId)
     const response = await request.call('session/prompt', {

@@ -1,5 +1,5 @@
 import type { AgentSideConnection } from '@agentclientprotocol/sdk'
-import type { PiRpcEvent, PiRpcProcess } from '../../src/pi-rpc/process.js'
+import type { PiAuthCheckResult, PiRpcEvent, PiRpcProcess } from '../../src/pi-rpc/process.js'
 
 type SessionUpdateMsg = Parameters<AgentSideConnection['sessionUpdate']>[0]
 
@@ -34,6 +34,14 @@ export class FakePiRpcProcess {
   readonly prompts: Array<{ message: string; attachments: unknown[] }> = []
   readonly extensionUiResponses: unknown[] = []
   abortCount = 0
+  authResult: PiAuthCheckResult = { status: 'ready' }
+  authCheck?: (provider: string) => Promise<PiAuthCheckResult>
+  authProviders: string[] = []
+  disposed = false
+  async checkAuth(provider: string): Promise<PiAuthCheckResult> {
+    this.authProviders.push(provider)
+    return this.authCheck?.(provider) ?? this.authResult
+  }
 
   onEvent(handler: (ev: PiRpcEvent) => void): () => void {
     this.handlers.push(handler)
@@ -58,16 +66,28 @@ export class FakePiRpcProcess {
     this.extensionUiResponses.push(response)
   }
 
+  getStateError?: Error
+  state: unknown = { model: { provider: 'test', id: 'model' }, thinkingLevel: 'medium' }
   async getState(): Promise<unknown> {
-    return {}
+    if (this.getStateError) throw this.getStateError
+    return this.state
+  }
+
+  dispose(): void {
+    this.disposed = true
+  }
+
+  async disposeAndWait(): Promise<void> {
+    this.dispose()
   }
 
   async getSessionStats(_signal?: AbortSignal): Promise<unknown> {
     return this.sessionStats
   }
 
+  availableModels: unknown = { models: [{ provider: 'test', id: 'model', name: 'model' }] }
   async getAvailableModels(): Promise<unknown> {
-    return { models: [{ provider: 'test', id: 'model', name: 'model' }] }
+    return this.availableModels
   }
 
   async getMessages(): Promise<unknown> {

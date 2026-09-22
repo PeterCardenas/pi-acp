@@ -33,6 +33,7 @@ test('PiAcpAgent: newSession returns configOptions for provider, model, and thin
       sessionId: 's1',
       cwd: process.cwd(),
       proc: {
+        checkAuth: async () => ({ status: 'ready' as const }),
         async getAvailableModels() {
           return {
             models: [
@@ -115,6 +116,7 @@ test('PiAcpAgent: setSessionConfigOption maps model changes to pi and emits conf
     sessionId: 's1',
     cwd: process.cwd(),
     proc: {
+      checkAuth: async () => ({ status: 'ready' as const }),
       async getAvailableModels() {
         return {
           models: [
@@ -167,6 +169,7 @@ test('PiAcpAgent: config model selection preserves slash-containing model IDs fo
     sessionId: 's1',
     cwd: process.cwd(),
     proc: {
+      checkAuth: async () => ({ status: 'ready' as const }),
       async getAvailableModels() {
         return {
           models: [
@@ -213,6 +216,7 @@ test('PiAcpAgent: rapid provider then model requests apply the requested model a
     sessionId: 's1',
     cwd: process.cwd(),
     proc: {
+      checkAuth: async () => ({ status: 'ready' as const }),
       async getAvailableModels() {
         return {
           models: [
@@ -306,6 +310,7 @@ test('PiAcpAgent: rapid thought-level updates await ordered mode notifications w
     sessionId: 's1',
     cwd: process.cwd(),
     proc: {
+      checkAuth: async () => ({ status: 'ready' as const }),
       async getAvailableModels() {
         return { models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }
       },
@@ -368,6 +373,7 @@ test('PiAcpAgent: provider selection uses a model from that provider and filters
     sessionId: 's1',
     cwd: process.cwd(),
     proc: {
+      checkAuth: async () => ({ status: 'ready' as const }),
       async getAvailableModels() {
         return {
           models: [
@@ -414,6 +420,7 @@ test('PiAcpAgent: setSessionConfigOption maps thought level changes to pi and em
     sessionId: 's1',
     cwd: process.cwd(),
     proc: {
+      checkAuth: async () => ({ status: 'ready' as const }),
       async getAvailableModels() {
         return {
           models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }]

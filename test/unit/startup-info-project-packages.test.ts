@@ -40,6 +40,7 @@ test('PiAcpAgent: startup info includes project-level packages from .pi/settings
       sessionId: 's1',
       cwd: projectDir,
       proc: {
+        checkAuth: async () => ({ status: 'ready' as const }),
         async getAvailableModels() {
           return { models: [{ provider: 'test', id: 'model', name: 'model' }] }
         },

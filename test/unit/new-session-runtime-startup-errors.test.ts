@@ -19,12 +19,17 @@ class FakeSessions {
   close(sessionId: string) {
     this.closeCalls.push(sessionId)
   }
+
+  async closeAndWait(sessionId: string) {
+    this.close(sessionId)
+  }
 }
 
 test('PiAcpAgent: newSession returns AUTH_REQUIRED when pi reports an auth error after spawn', async () => {
   const conn = new FakeAgentSideConnection()
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-runtime-auth-'))
   const sessionFile = join(root, 'sessions', 'failed.jsonl')
+  const childReportedSessionFile = join(root, 'arbitrary-child-reported.jsonl')
   const sessionMapPath = join(root, 'session-map.json')
 
   mkdirSync(join(root, 'sessions'), { recursive: true })
@@ -39,6 +44,7 @@ test('PiAcpAgent: newSession returns AUTH_REQUIRED when pi reports an auth error
     }) + '\n',
     'utf-8'
   )
+  writeFileSync(childReportedSessionFile, 'child data\n', 'utf-8')
 
   const session = {
     sessionId: 's-auth',
@@ -48,7 +54,7 @@ test('PiAcpAgent: newSession returns AUTH_REQUIRED when pi reports an auth error
         throw new Error('Authentication required: missing key')
       },
       async getState() {
-        return { thinkingLevel: 'medium', model: null, sessionFile }
+        return { thinkingLevel: 'medium', model: null, sessionFile: childReportedSessionFile }
       }
     }
   }
@@ -66,7 +72,7 @@ test('PiAcpAgent: newSession returns AUTH_REQUIRED when pi reports an auth error
   )
 
   assert.deepEqual(sessions.closeCalls, ['s-auth'])
-  assert.equal(existsSync(sessionFile), false)
+  assert.equal(existsSync(childReportedSessionFile), true)
   assert.equal(store.get('s-auth'), null)
 })
 

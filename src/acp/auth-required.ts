@@ -6,6 +6,10 @@ import { getAuthMethods } from './auth.js'
  *
  * We can't do a full provider-specific check here, so we look for bounded, explicit evidence.
  */
+export function authRequiredError(message = 'Configure an API key or log in with an OAuth provider.'): RequestError {
+  return RequestError.authRequired({ authMethods: getAuthMethods() }, message)
+}
+
 export function maybeAuthRequiredError(err: unknown): RequestError | null {
   const msg = String((err as { message?: unknown })?.message ?? err ?? '')
   const s = msg.toLowerCase()
@@ -17,10 +21,5 @@ export function maybeAuthRequiredError(err: unknown): RequestError | null {
   if (!authEvidence) return null
 
   // Include terminal auth method options in error data.
-  return RequestError.authRequired(
-    {
-      authMethods: getAuthMethods()
-    },
-    'Configure an API key or log in with an OAuth provider.'
-  )
+  return authRequiredError()
 }

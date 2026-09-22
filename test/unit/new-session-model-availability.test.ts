@@ -10,6 +10,7 @@ type TestSession = {
   proc: {
     getAvailableModels(): Promise<{ models: unknown[] }>
     getState(): Promise<unknown>
+    dispose?(): void
   }
 }
 
@@ -26,6 +27,11 @@ class FakeSessions {
 
   close(sessionId: string) {
     this.closeCalls.push(sessionId)
+    this.session.proc.dispose?.()
+  }
+
+  async closeAndWait(sessionId: string) {
+    this.close(sessionId)
   }
 }
 
@@ -51,6 +57,44 @@ test('PiAcpAgent: state auth error takes precedence over empty available models'
     return typeof error === 'object' && error !== null && 'code' in error && error.code === -32000
   })
   assert.deepEqual(sessions.closeCalls, ['s-auth'])
+})
+
+test('PiAcpAgent: malformed available models fail cleanly without auth checks', async () => {
+  const conn = new FakeAgentSideConnection()
+  let authChecks = 0
+  let disposed = 0
+  const session = {
+    sessionId: 's-malformed',
+    cwd: process.cwd(),
+    proc: {
+      async getAvailableModels() {
+        return { models: [null, { provider: 42 }] }
+      },
+      async getState() {
+        return { thinkingLevel: 'medium', model: null }
+      },
+      async checkAuth() {
+        authChecks++
+        return { status: 'ready' }
+      },
+      dispose() {
+        disposed++
+      }
+    }
+  }
+  const sessions = new FakeSessions(session)
+  const agent = new PiAcpAgent(asAgentConn(conn), {})
+  Reflect.set(agent, 'sessions', sessions)
+
+  await assert.rejects(
+    agent.newSession({ cwd: process.cwd(), mcpServers: [] } satisfies NewSessionRequest),
+    (error: unknown) => {
+      return typeof error === 'object' && error !== null && 'code' in error && error.code === -32603
+    }
+  )
+  assert.equal(authChecks, 0)
+  assert.equal(disposed, 1)
+  assert.deepEqual(sessions.closeCalls, ['s-malformed'])
 })
 
 test('PiAcpAgent: newSession throws internal error when pi reports zero available models', async () => {

@@ -44,7 +44,7 @@ import { promptToPiMessage } from './translate/prompt.js'
 import { loadSlashCommands, parseCommandArgs, toAvailableCommands } from './slash-commands.js'
 import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
-import { maybeAuthRequiredError } from './auth-required.js'
+import { authRequiredError, maybeAuthRequiredError } from './auth-required.js'
 import { isAbsolute } from 'node:path'
 import { existsSync, readFileSync, realpathSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import type { AvailableCommand } from '@agentclientprotocol/sdk'
@@ -157,23 +157,13 @@ export class PiAcpAgent implements ACPAgent {
     }
   }
 
-  private cleanupFailedNewSession(sessionId: string, state?: any | null): void {
-    this.sessions.close(sessionId)
-
-    const sessionFile =
-      typeof state?.sessionFile === 'string' && state.sessionFile.trim()
-        ? state.sessionFile
-        : this.store.get(sessionId)?.sessionFile
-
-    if (typeof sessionFile === 'string' && sessionFile.trim()) {
-      try {
-        if (existsSync(sessionFile)) unlinkSync(sessionFile)
-      } catch {
-        // ignore cleanup failures; the auth/internal error is the primary result
-      }
-    }
-
+  private async cleanupFailedNewSession(sessionId: string): Promise<void> {
     this.store.delete(sessionId)
+    try {
+      await this.sessions.closeAndWait(sessionId)
+    } catch {
+      // Preserve the ACP error that caused session/new to fail.
+    }
   }
 
   private findStoredSession(sessionId: string): { cwd: string; sessionFile: string } | null {
@@ -338,32 +328,74 @@ export class PiAcpAgent implements ACPAgent {
     const availableModelsAuthErr = maybeAuthRequiredError(availableModelsErr)
 
     if (stateAuthErr) {
-      this.cleanupFailedNewSession(session.sessionId, state)
+      await this.cleanupFailedNewSession(session.sessionId)
       throw stateAuthErr
     }
 
     if (availableModelsAuthErr) {
-      this.cleanupFailedNewSession(session.sessionId, state)
+      await this.cleanupFailedNewSession(session.sessionId)
       throw availableModelsAuthErr
     }
 
     if (availableModelsErr) {
-      this.cleanupFailedNewSession(session.sessionId, state)
+      await this.cleanupFailedNewSession(session.sessionId)
       throw RequestError.internalError({}, String((availableModelsErr as Error)?.message ?? availableModelsErr))
+    }
+
+    if (stateErr) {
+      await this.cleanupFailedNewSession(session.sessionId)
+      throw RequestError.internalError({}, String((stateErr as Error)?.message ?? stateErr))
     }
 
     // An empty successful model list is a configuration problem, not authentication evidence.
     const rawModelsCount = Array.isArray(availableModels?.models) ? availableModels.models.length : 0
 
     if (rawModelsCount === 0) {
-      this.cleanupFailedNewSession(session.sessionId, state)
+      await this.cleanupFailedNewSession(session.sessionId)
       throw RequestError.internalError({}, 'No models configured')
     }
 
-    const { configOptions, models, modes } = await getSessionConfiguration(session.proc, {
-      state,
-      availableModels
-    })
+    let config: Awaited<ReturnType<typeof getSessionConfiguration>>
+    try {
+      config = await getSessionConfiguration(session.proc, {
+        state,
+        availableModels
+      })
+    } catch (error) {
+      await this.cleanupFailedNewSession(session.sessionId)
+      throw RequestError.internalError({}, String((error as Error)?.message ?? error))
+    }
+
+    const { configOptions, models, modes } = config
+    const currentModelId = models?.currentModelId
+    const advertisedModels = new Set(models?.availableModels.map(model => model.modelId) ?? [])
+    if (!currentModelId) {
+      await this.cleanupFailedNewSession(session.sessionId)
+      throw RequestError.internalError({}, 'No model selected')
+    }
+    if (!advertisedModels.has(currentModelId)) {
+      await this.cleanupFailedNewSession(session.sessionId)
+      throw RequestError.internalError({}, 'Selected model is not available')
+    }
+    const provider = currentModelId.split('/')[0]
+    try {
+      const auth = await session.proc.checkAuth(provider)
+      if (auth.status === 'not_ready') {
+        await this.cleanupFailedNewSession(session.sessionId)
+        if (auth.reason === 'credentials_not_configured' || auth.reason === 'credential_not_available') {
+          throw authRequiredError()
+        }
+        throw RequestError.internalError({}, 'Pi auth check returned an invalid state')
+      }
+      if (auth.status === 'invalid') {
+        await this.cleanupFailedNewSession(session.sessionId)
+        throw RequestError.internalError({}, 'Pi auth check returned an invalid state')
+      }
+    } catch (error: unknown) {
+      if (error instanceof RequestError) throw error
+      await this.cleanupFailedNewSession(session.sessionId)
+      throw RequestError.internalError({}, 'Pi auth check failed')
+    }
 
     const quietStartup = getQuietStartup(params.cwd)
     const updateNotice = buildUpdateNotice()
