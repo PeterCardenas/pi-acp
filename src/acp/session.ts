@@ -185,9 +185,17 @@ export class SessionManager {
     try {
       s.proc.dispose?.()
     } catch {
-      // ignore
+      /* best effort for synchronous callers */
     }
     this.sessions.delete(sessionId)
+  }
+
+  async closeAndWait(sessionId: string): Promise<void> {
+    const s = this.sessions.get(sessionId)
+    if (!s) return
+    this.sessions.delete(sessionId)
+    if (s.proc.disposeAndWait) await s.proc.disposeAndWait()
+    else s.proc.dispose?.()
   }
 
   async create(params: SessionCreateParams): Promise<PiAcpSession> {
