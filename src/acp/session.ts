@@ -293,8 +293,7 @@ export class PiAcpSession {
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
   // and clients may hide progress if we ever downgrade back to `pending`.
   private currentToolCalls = new Map<string, 'pending' | 'in_progress'>()
-  private subagentToolCallIds = new Set<string>()
-  private activeSubagentToolCalls = 0
+  private executingSubagentToolCallIds = new Set<string>()
   // Streaming only describes arguments; active subagents begin at execution start.
   private streamedSubagentToolCallIds = new Set<string>()
   // Buffered usage from the most recent top-level `turn_end` for the current prompt.
@@ -544,9 +543,7 @@ export class PiAcpSession {
     this.toolExecutionSnapshots.delete(toolCallId)
     this.toolExecutionOutputs.delete(toolCallId)
     this.streamedSubagentToolCallIds.delete(toolCallId)
-    if (this.subagentToolCallIds.delete(toolCallId)) {
-      this.activeSubagentToolCalls = Math.max(0, this.activeSubagentToolCalls - 1)
-    }
+    this.executingSubagentToolCallIds.delete(toolCallId)
   }
 
   // get_session_stats is required for correct ACP semantics; stats failures omit the
@@ -593,11 +590,10 @@ export class PiAcpSession {
   // dangling from a prior turn (e.g. aborted mid-execution with no `tool_execution_end`)
   // cannot permanently suppress usage_update or streamed output in future turns.
   private resetSubagentTracking(): void {
-    this.subagentToolCallIds.clear()
+    this.executingSubagentToolCallIds.clear()
     this.streamedSubagentToolCallIds.clear()
     this.toolExecutionSnapshots.clear()
     this.toolExecutionOutputs.clear()
-    this.activeSubagentToolCalls = 0
   }
 
   private startTurn(t: QueuedTurn): void {
@@ -774,12 +770,10 @@ export class PiAcpSession {
         const toolCallId = String((ev as any).toolCallId ?? crypto.randomUUID())
         const toolName = String((ev as any).toolName ?? 'tool')
         const args = (ev as any).args
-        // Count active subagents only once execution begins.
-        if (toolName === 'subagent' && !this.subagentToolCallIds.has(toolCallId)) {
-          this.subagentToolCallIds.add(toolCallId)
-          this.activeSubagentToolCalls += 1
+        if (toolName === 'subagent') {
+          this.executingSubagentToolCallIds.add(toolCallId)
+          this.streamedSubagentToolCallIds.delete(toolCallId)
         }
-        this.streamedSubagentToolCallIds.delete(toolCallId)
         let line: number | undefined
 
         if (
@@ -864,7 +858,7 @@ export class PiAcpSession {
         if (!toolCallId) break
 
         const partial = (ev as any).partialResult
-        if (this.subagentToolCallIds.has(toolCallId) || this.streamedSubagentToolCallIds.has(toolCallId)) break
+        if (this.executingSubagentToolCallIds.has(toolCallId) || this.streamedSubagentToolCallIds.has(toolCallId)) break
         if (this.bashToolCallIds.has(toolCallId)) {
           this.emitBashOutputUpdate({ toolCallId, status: 'in_progress', result: partial })
           break
@@ -1014,10 +1008,10 @@ export class PiAcpSession {
       }
 
       case 'turn_end': {
-        // pi emits nested `turn_end` events for a subagent's own inner loop while a
-        // `subagent` tool call is executing. Those usage figures describe the child
-        // run, not the top-level conversation, so they must not be surfaced or buffered.
-        if (!this.cancelRequested && this.activeSubagentToolCalls === 0) {
+        // Pi's top-level turn_end occurs only after parent tool executions complete.
+        // Therefore an end seen while an exact subagent execution is active is nested,
+        // regardless of args or future subagent schema changes.
+        if (!this.cancelRequested && this.executingSubagentToolCallIds.size === 0) {
           this.pendingUsageEvent = ev
         }
         // pi uses `turn_end` for sub-steps (e.g. tool_use) and will often start another turn.

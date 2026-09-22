@@ -290,7 +290,7 @@ test('PiAcpSession: suppresses usage_update from turn_end while a subagent tool 
     type: 'tool_execution_start',
     toolCallId: 'subagent-1',
     toolName: 'subagent',
-    args: { task: 'inspect' }
+    args: { futureSchema: true }
   })
 
   // Nested turn_end events from the subagent's own inner loop should not surface usage.
@@ -315,6 +315,105 @@ test('PiAcpSession: suppresses usage_update from turn_end while a subagent tool 
     used: 42,
     size: 8192
   })
+})
+
+test('PiAcpSession: suppresses background progress but emits usage and final output', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.getState = async () => ({ model: { contextWindow: 8192 } })
+  proc.sessionStats = { contextUsage: { tokens: 42, contextWindow: 8192 } }
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: asPiRpcProcess(proc),
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+  const settled = session.prompt('hello')
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'subagent-bg',
+    toolName: 'subagent',
+    args: { agent: 'worker', async: true }
+  })
+  proc.emit({
+    type: 'tool_execution_update',
+    toolCallId: 'subagent-bg',
+    partialResult: { content: [{ type: 'text', text: 'progress' }] }
+  })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'subagent-bg',
+    isError: false,
+    result: { content: [{ type: 'text', text: 'final output' }] }
+  })
+  proc.emit({ type: 'turn_end', message: { usage: { input: 42 }, contextWindow: 8192 } })
+  proc.emit({ type: 'agent_settled' })
+  await settled
+  await new Promise(resolve => setTimeout(resolve, 0))
+  assert.equal(conn.updates.filter(update => update.update.sessionUpdate === 'usage_update').length, 1)
+  assert.equal(
+    conn.updates.some(
+      update =>
+        update.update.sessionUpdate === 'tool_call_update' &&
+        JSON.stringify(update.update.content ?? '').includes('progress')
+    ),
+    false
+  )
+  assert.equal(
+    conn.updates.some(update => JSON.stringify(update.update).includes('final output')),
+    true
+  )
+})
+
+test('PiAcpSession: management subagent emits usage after completion', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.getState = async () => ({ model: { contextWindow: 8192 } })
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: asPiRpcProcess(proc),
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+  const settled = session.prompt('hello')
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 'subagent-management',
+    toolName: 'subagent',
+    args: { action: 'status' }
+  })
+  proc.emit({
+    type: 'tool_execution_update',
+    toolCallId: 'subagent-management',
+    partialResult: { content: [{ type: 'text', text: 'progress' }] }
+  })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'subagent-management',
+    isError: false,
+    result: { content: [{ type: 'text', text: 'done' }] }
+  })
+  proc.emit({ type: 'turn_end', message: { usage: { input: 42 }, contextWindow: 8192 } })
+  proc.emit({ type: 'agent_settled' })
+  await settled
+  await new Promise(resolve => setTimeout(resolve, 0))
+  assert.equal(conn.updates.filter(update => update.update.sessionUpdate === 'usage_update').length, 1)
+  assert.equal(
+    conn.updates.some(update => JSON.stringify(update.update).includes('done')),
+    true
+  )
+  assert.equal(
+    conn.updates.some(
+      update =>
+        update.update.sessionUpdate === 'tool_call_update' &&
+        JSON.stringify(update.update.content ?? '').includes('progress')
+    ),
+    false
+  )
 })
 
 test('PiAcpSession: rejects active and queued prompts when pi reports a runtime authentication error', async () => {
@@ -562,7 +661,7 @@ test('PiAcpSession: cancelling mid-subagent-tool-call does not permanently suppr
     type: 'tool_execution_start',
     toolCallId: 'subagent-1',
     toolName: 'subagent',
-    args: { task: 'inspect' }
+    args: { futureSchema: true }
   })
 
   // Cancel while the subagent tool call is still in flight; no tool_execution_end
@@ -1003,7 +1102,7 @@ test('PiAcpSession: suppresses streamed subagent updates by tracked id', async (
     type: 'tool_execution_start',
     toolCallId: 'subagent-1',
     toolName: 'subagent',
-    args: { task: 'inspect' }
+    args: { agent: 'worker', task: 'inspect', async: false }
   })
   for (const text of [
     'child output 1',
